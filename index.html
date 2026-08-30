@@ -636,7 +636,7 @@
   #analysis .mstem{width:1.5px; height:22px; background:var(--line)}
   #analysis .mrow{display:flex; gap:14px; width:100%; justify-content:center; flex-wrap:wrap; position:relative; padding-top:0}
   #analysis .mcard{background:#fff; border:2px solid var(--enab-b); width:240px; flex:1 1 220px; max-width:255px; padding:0 0 12px}
-  #analysis .mcard .mchd{background:var(--perf); color:#fff; padding:9px 12px}
+  #analysis .mcard .mchd{background:var(--perf); color:#fff; padding:9px 12px; min-height:70px; box-sizing:border-box}
   #analysis .mcard.apx .mchd{background:var(--apex)}
   #analysis .mcard .mchd .t{font-family:var(--serif); font-weight:750; font-size:14.5px; line-height:1.2}
   #analysis .mcard .mchd .m{font-size:10px; letter-spacing:.09em; text-transform:uppercase; opacity:.85; margin-top:2px}
@@ -653,14 +653,16 @@
 
   #analysis .cmp{margin-top:26px; overflow-x:auto}
   #analysis table.ct{border-collapse:collapse; width:100%; font-size:12.5px; min-width:820px}
-  #analysis .ct th{font-size:10.5px; letter-spacing:.07em; text-transform:uppercase; color:var(--muted); text-align:right; padding:7px 9px; border-bottom:2px solid var(--line); white-space:nowrap}
+  #analysis .ct th{font-size:10.5px; letter-spacing:.07em; text-transform:uppercase; color:var(--muted); text-align:right; padding:7px 7px; border-bottom:2px solid var(--line); white-space:normal; line-height:1.15; vertical-align:bottom}
   #analysis .ct th:first-child,#analysis .ct td:first-child{text-align:left}
-  #analysis .ct td{padding:7px 9px; border-bottom:1px solid var(--hair); text-align:right; white-space:nowrap}
-  #analysis .ct td.co{text-align:left}
+  #analysis .ct td{padding:7px 7px; border-bottom:1px solid var(--hair); text-align:right; white-space:nowrap; vertical-align:top}
+  #analysis .ct td.fnd{white-space:normal; min-width:190px; max-width:260px; text-align:left; line-height:1.3}
+  #analysis .ct tr.bad td.msg{white-space:normal; text-align:left}
+  #analysis .ct td.co{text-align:left; white-space:normal; min-width:150px; max-width:200px; line-height:1.25}
   #analysis .ct td.co b{font-weight:800}
   #analysis .ct td.co span{color:var(--muted); font-size:11.5px}
   #analysis .ct tr.sel td{background:#FFF7E0}
-  #analysis .ct td .asf{display:block; font-size:10px; color:var(--muted)}
+  #analysis .ct td .asf{display:block; font-size:10px; color:var(--muted); white-space:normal; line-height:1.25}
   #analysis .ct tr.bad td{color:var(--muted); font-style:italic}
   #analysis .ftnote{margin-top:18px; font-size:11.5px; color:var(--muted); line-height:1.6; max-width:900px}
   #analysis .errbox{display:none; margin-top:16px; border:1.5px solid var(--needs); background:#F2F4F8; padding:10px 13px; font-size:13px}
@@ -1688,7 +1690,7 @@
   function $(id){ return document.getElementById(id); }
   function fmtMcap(v){ if(v>=1e12) return "$"+(v/1e12).toFixed(2)+"T"; if(v>=1e9) return "$"+(v/1e9).toFixed(1)+"B"; return "$"+(v/1e6).toFixed(0)+"M"; }
   function fmtDate(d){ if(!d) return ""; var p=d.split("-"); var M=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]; return M[+p[1]-1]+" "+(+p[2])+", "+p[0]; }
-  function pct(v,dp){ return (v>=0?"":"\u2212")+Math.abs(v*100).toFixed(dp===undefined?1:dp)+"%"; }
+  function pct(v,dp){ var t=Math.abs(v*100).toFixed(dp===undefined?1:dp); return ((v>=0||parseFloat(t)===0)?"":"\u2212")+t+"%"; }
 
   /* ---------- tabs ---------- */
   var tabMap=$("tabMap"), tabAn=$("tabAnalysis");
@@ -1757,10 +1759,11 @@
     var t=r[0], ind=r[2], sec=r[3], mc=r[4];
     function near(a){ return Math.abs(Math.log(a[4])-Math.log(mc)); }
     var same=ROWS.filter(function(x){ return x[0]!==t && x[2]===ind && x[2]!=="\u2014"; }).sort(function(a,b){ return near(a)-near(b); });
-    var out=same.slice(0,8);
-    if(out.length<8){
+    var N=7; /* suggest 7, leaving one of the 8 slots open for the user's own pick */
+    var out=same.slice(0,N);
+    if(out.length<N){
       var fill=ROWS.filter(function(x){ return x[0]!==t && x[3]===sec && x[2]!==ind; }).sort(function(a,b){ return near(a)-near(b); });
-      out=out.concat(fill.slice(0, 8-out.length));
+      out=out.concat(fill.slice(0, N-out.length));
     }
     return out.map(function(x){ return x[0]; });
   }
@@ -1917,13 +1920,13 @@
         .catch(function(e){ ungate(); conceptCache[key]=null; return null; });
     });
   }
-  function conceptFallback(cik){
+  function conceptFallback(cik, why){
     var jobs=[];
     ALL_CHAINS.forEach(function(ch){ ch.forEach(function(tt){ jobs.push(getConcept(cik, tt[0], tt[1]).then(function(j){ return j?{tx:tt[0],tg:tt[1],units:j.units}:null; })); }); });
     return Promise.all(jobs).then(function(rs){
       var facts={facts:{}, _src:"per-concept"}, any=false;
       rs.forEach(function(r){ if(!r) return; any=true; if(!facts.facts[r.tx]) facts.facts[r.tx]={}; facts.facts[r.tx][r.tg]={units:r.units}; });
-      if(!any) throw new Error(net.ok ? "no SEC financial data found for this filer" : "could not reach SEC EDGAR");
+      if(!any) throw new Error((net.ok ? "no SEC financial data found for this filer" : "could not reach SEC EDGAR")+(why?" (company-facts: "+why+")":""));
       return facts;
     });
   }
@@ -1932,7 +1935,7 @@
     return fetchJSON("sec","https://data.sec.gov/api/xbrl/companyfacts/CIK"+cik+".json",
         {validate:function(j){ return j && j.facts; }, timeout:60000, maxBytes:45e6, routes:TRUSTED})
       .then(function(j){ if(j){ j._src="companyfacts"; return j; } throw new Error("EDGAR has no XBRL financial data for this filer"); },
-            function(e){ return conceptFallback(cik); })
+            function(e){ return conceptFallback(cik, (e&&e.message)||"failed"); })
       .then(function(f){ factsCache[cik]=f; return f; });
   }
   function getQuote(t){
@@ -1951,15 +1954,35 @@
   function days(a,b){ return (new Date(b)-new Date(a))/864e5; }
   function addDays(iso,n){ var d=new Date(iso); d.setUTCDate(d.getUTCDate()+n); return d.toISOString().slice(0,10); }
   function near(a,b,tol){ return Math.abs(days(a,b))<=tol; }
-  function unitsOf(node, kind){
+  /* kind: "money" (must match the company's reporting currency `cur`), "eps" (per-share
+     in that currency), "shares". Money concepts in any other currency are ignored so a
+     ratio never mixes, say, TWD revenue with a USD convenience translation of assets. */
+  function unitsOf(node, kind, cur){
     if(!node||!node.units) return null;
     var keys=Object.keys(node.units), key=null;
-    if(kind==="eps") key=keys.filter(function(k){ return /USD\/shares/i.test(k); })[0]||keys.filter(function(k){ return /shares/i.test(k); })[0];
-    else if(kind==="shares") key=keys.filter(function(k){ return /^shares$/i.test(k); })[0];
-    else key=node.units.USD?"USD":null;
-    if(!key) key=keys[0];
+    if(kind==="eps"){ key=keys.filter(function(k){ return k.toUpperCase()===(cur+"/SHARES").toUpperCase(); })[0]||keys.filter(function(k){ return /\/shares$/i.test(k); })[0]; }
+    else if(kind==="shares"){ key=keys.filter(function(k){ return /^shares$/i.test(k); })[0]; }
+    else { key=node.units[cur]?cur:null; }
+    if(!key) return null;
     var un=node.units[key];
     return (un&&un.length)?{u:un,cur:key}:null;
+  }
+  /* Revenue decides the reporting currency: across every revenue tag AND every unit
+     filed, the (tag, currency) pair with the most recent data wins; USD breaks ties. */
+  function pickRevenue(facts){
+    var best=null;
+    T_REV.forEach(function(tt, idx){
+      var node=facts.facts && facts.facts[tt[0]] && facts.facts[tt[0]][tt[1]];
+      if(!node||!node.units) return;
+      Object.keys(node.units).forEach(function(cur){
+        if(!/^[A-Z]{3}$/.test(cur)) return;
+        var s=durSeries(node.units[cur]); if(!s.length) return;
+        var latest=s[s.length-1].end;
+        var better = !best || latest>best.latest || (latest===best.latest && ((cur==="USD" && best.cur!=="USD") || (cur===best.cur && idx<best.idx)));
+        if(better) best={s:s, latest:latest, idx:idx, tag:tt[1], cur:cur};
+      });
+    });
+    return best;
   }
   function durSeries(un){
     if(!un) return [];
@@ -1983,11 +2006,11 @@
   }
   /* Among every candidate tag the company has actually filed, choose the one whose
      data reaches the most recent period; chain order only breaks ties. */
-  function pickSeries(facts, chain, mode, kind){
+  function pickSeries(facts, chain, mode, kind, cur){
     var best=null;
     chain.forEach(function(tt, idx){
       var node=facts.facts && facts.facts[tt[0]] && facts.facts[tt[0]][tt[1]];
-      var U=unitsOf(node, kind); if(!U) return;
+      var U=unitsOf(node, kind, cur); if(!U) return;
       var s=(mode==="dur")?durSeries(U.u):instSeries(U.u);
       if(!s.length) return;
       var latest=s[s.length-1].end;
@@ -2057,11 +2080,12 @@
   function monthsAgo(iso){ return days(iso, new Date().toISOString().slice(0,10))/30.4; }
 
   function computeMetrics(row, facts, quote){
-    var out={t:row[0], name:row[1], ok:true, notes:[], flags:{}, src:facts._src||""};
+    var out={t:row[0], name:row[1], ok:true, notes:[], flags:{}, nm:{}, src:facts._src||""};
     var fin=(row[3]==="Finance");
     try{
-      var R=pickSeries(facts,T_REV,"dur","usd");
+      var R=pickRevenue(facts);
       if(!R) throw new Error("no revenue concept in this filer\u2019s XBRL");
+      var cur=R.cur;
       var revTTM=ttmOf(R.s);
       if(!revTTM) throw new Error("revenue periods could not be assembled");
       if(monthsAgo(revTTM.end)>18) throw new Error("latest SEC financial data ends "+fmtDate(revTTM.end));
@@ -2075,10 +2099,10 @@
       var qs=deriveQuarters(R.s), y=R.s.filter(isFY);
       if(qs.length){
         var ql=qs[qs.length-1], prev=qs.length>1?qs[qs.length-2]:null;
-        if(prev && near(addDays(prev.end,1), ql.start, 6) && prev.val>0){ out.qoq=ql.val/prev.val-1; if(ql.derived||prev.derived) out.flags.g=true; }
+        if(prev && near(addDays(prev.end,1), ql.start, 6) && prev.val>0){ out.qoq=ql.val/prev.val-1; if(ql.derived||prev.derived) out.flags.qoq=true; }
         var ya=null, target=addDays(ql.end,-365);
         qs.forEach(function(e){ if(near(e.end,target,20) && (!ya || Math.abs(days(e.end,target))<Math.abs(days(ya.end,target)))) ya=e; });
-        if(ya && ya.val>0){ out.yoy=ql.val/ya.val-1; if(ql.derived||ya.derived) out.flags.g=true; }
+        if(ya && ya.val>0){ out.yoy=ql.val/ya.val-1; if(ql.derived||ya.derived) out.flags.yoy=true; }
         out.gEnd=ql.end; out.gPer="Q ended "+fmtDate(ql.end);
       }
       if(out.yoy===undefined && y.length>=2){
@@ -2088,7 +2112,7 @@
       }
 
       /* tax rate */
-      var P=pickSeries(facts,T_PRETAX,"dur","usd"), X=pickSeries(facts,T_TAX,"dur","usd");
+      var P=pickSeries(facts,T_PRETAX,"dur","money",cur), X=pickSeries(facts,T_TAX,"dur","money",cur);
       var preTTM=P?ttmOf(P.s):null, taxTTM=X?ttmOf(X.s):null, rate=0.21;
       if(preTTM && taxTTM && preTTM.val>0) rate=Math.min(0.5, Math.max(0, taxTTM.val/preTTM.val));
       else out.notes.push("statutory 21% tax rate assumed");
@@ -2098,10 +2122,10 @@
       if(fin){
         out.nmFin=true; out.notes.push("financial company \u2014 operating margin & ROIC not meaningful");
       }else{
-        var O=pickSeries(facts,T_OPI,"dur","usd"), opiTTM=O?ttmOf(O.s):null, ebit=null;
+        var O=pickSeries(facts,T_OPI,"dur","money",cur), opiTTM=O?ttmOf(O.s):null, ebit=null;
         if(opiTTM){ ebit=opiTTM; }
         else if(preTTM){
-          var I=pickSeries(facts,T_INT,"dur","usd"), intTTM=I?ttmOf(I.s):null;
+          var I=pickSeries(facts,T_INT,"dur","money",cur), intTTM=I?ttmOf(I.s):null;
           ebit={val:preTTM.val+(intTTM?intTTM.val:0), end:preTTM.end, derived:true};
           out.flags.ebit=true;
           out.notes.push(intTTM ? "no operating-income tag \u2014 EBIT = pretax income + interest expense" : "no operating-income or interest tag \u2014 pretax income used as EBIT");
@@ -2113,7 +2137,7 @@
       }
 
       /* asset turnover */
-      var A=pickSeries(facts,T_ASSETS,"inst","usd");
+      var A=pickSeries(facts,T_ASSETS,"inst","money",cur);
       if(A){
         var aNow=valAsOf(A.s,null), aAgo=nearYearAgo(A.s,aNow.end);
         var avgA=aAgo?(aNow.val+aAgo.val)/2:aNow.val;
@@ -2122,8 +2146,8 @@
 
       /* ROIC */
       if(!fin && out.nopat!==undefined){
-        var E=pickSeries(facts,T_EQ,"inst","usd"), C=pickSeries(facts,T_CASH,"inst","usd");
-        var DL=pickSeries(facts,T_DEBT_L,"inst","usd"), DC=pickSeries(facts,T_DEBT_C,"inst","usd");
+        var E=pickSeries(facts,T_EQ,"inst","money",cur), C=pickSeries(facts,T_CASH,"inst","money",cur);
+        var DL=pickSeries(facts,T_DEBT_L,"inst","money",cur), DC=pickSeries(facts,T_DEBT_C,"inst","money",cur);
         if(E){
           function icAt(end){
             var e=valAsOf(E.s,end); if(!e) return null;
@@ -2134,25 +2158,25 @@
           var ic=(icN!=null&&icA!=null)?(icN+icA)/2:icN;
           if(!DL && !DC) out.notes.push("no debt tags found \u2014 invested capital = equity \u2212 cash");
           if(ic!=null && ic>0){ out.roic=out.nopat/ic; out.icEnd=eNow.end; if(out.flags.om) out.flags.roic=true; }
-          else out.notes.push("negative invested capital \u2014 ROIC n/m");
+          else { out.nm.roic=true; out.notes.push("negative invested capital \u2014 ROIC n/m"); }
         }else out.notes.push("no equity tag \u2014 ROIC n/a");
       }
 
       /* earnings multiple */
-      var EP=pickSeries(facts,T_EPS,"dur","eps"), epsTTM=EP?ttmOf(EP.s):null;
+      var EP=pickSeries(facts,T_EPS,"dur","eps",cur), epsTTM=EP?ttmOf(EP.s):null;
       var px=(quote&&quote.live&&quote.px)?quote.px:row[5];
       out.px=px; out.pxLive=!!(quote&&quote.live);
       out.pxAsOf=out.pxLive?(quote.ts?String(quote.ts):"delayed quote"):("close "+fmtDate(U.asof));
-      var epsUSD = EP && /^USD\//i.test(EP.cur);
+      var epsUSD = EP && /^USD\//i.test(EP.cur) && cur==="USD";
       if(foreign || (EP && !epsUSD)){
         out.pe=null; out.notes.push(foreign ? "foreign filer (20-F/40-F) \u2014 P/E n/a (ADR ratio)" : "EPS reported in "+EP.cur+" \u2014 P/E n/a");
       }
       else if(epsTTM && epsTTM.val>0){ out.pe=px/epsTTM.val; out.peEnd=epsTTM.end; if(epsTTM.derived) out.flags.pe=true; }
-      else if(epsTTM){ out.pe=null; out.notes.push("negative EPS \u2014 multiple n/m"); }
+      else if(epsTTM){ out.pe=null; out.nm.pe=true; out.notes.push("negative EPS \u2014 multiple n/m"); }
       else out.notes.push("no EPS tag \u2014 P/E n/a");
 
       if(!foreign && R.cur==="USD"){
-        var S=pickSeries(facts,T_SHARES,"inst","shares");
+        var S=pickSeries(facts,T_SHARES,"inst","shares",cur);
         var shNow=S?valAsOf(S.s,null):null;
         if(shNow && shNow.val>0) out.mcapLive=px*shNow.val;
       }
@@ -2261,7 +2285,7 @@
     /* apex */
     var roics=ok.map(function(r){ return r.roic; }).filter(function(v){ return v!=null&&isFinite(v); });
     var peerRoics=ok.slice(0).filter(function(r){return r!==mine;}).map(function(r){return r.roic;}).filter(function(v){return v!=null&&isFinite(v);});
-    $("mApexBig").innerHTML = mine.ok ? (mine.nmFin ? '<span class="na" title="financial company \u2014 not meaningful">n/m</span>' : fmtVal("pct",mine.roic)) : '<span class="na">n/a</span>';
+    $("mApexBig").innerHTML = mine.ok ? ((mine.nmFin||mine.nm.roic) ? '<span class="na" title="not meaningful \u2014 see table">n/m</span>' : fmtVal("pct",mine.roic)) : '<span class="na">n/a</span>';
     $("mApexMed").textContent = peerRoics.length? ("peer median "+pct(median(peerRoics))+(mine.ok&&mine.roic!=null?(" \u00b7 "+ord(rankOf(mine.roic,roics,true))+" of "+roics.length):"")) : "";
 
     var cards="";
@@ -2271,7 +2295,7 @@
       var mv=mine.ok?mine[M.key]:null;
       var all=vals.filter(function(v){return v!=null&&isFinite(v);});
       cards+='<div class="mcard"><div class="mchd"><div class="t">'+M.t+'</div><div class="m">'+M.m+'</div></div>'
-        + '<div class="big">'+((mine.ok&&mine.nmFin&&M.k==="om")?'<span class="na" title="financial company \u2014 not meaningful">n/m</span>':fmtVal(M.kind,mv))+'</div>'
+        + '<div class="big">'+((mine.ok&&((mine.nmFin&&M.k==="om")||(M.k==="pe"&&mine.nm.pe)))?'<span class="na" title="not meaningful \u2014 see table">n/m</span>':fmtVal(M.kind,mv))+'</div>'
         + '<div class="med">'+(pvals.length?("peer median "+fmtVal(M.kind,median(pvals))):"no peer data")+'</div>'
         + strip(all, (mv!=null&&isFinite(mv))?mv:null)
         + '<div class="rank">'+((mv!=null&&isFinite(mv)&&all.length>1)?(ord(rankOf(mv,all,M.hi))+" of "+all.length):"")+'</div>'
@@ -2282,23 +2306,24 @@
     /* table */
     var NM='<span class="na" title="financial company \u2014 not meaningful">n/m</span>';
     function dv(on){ return on?'<span class="dv" title="includes a derived figure \u2014 see notes">\u2020</span>':''; }
+    function NM2(why){ return '<span class="na" title="'+esc(why)+' \u2014 not meaningful">n/m</span>'; }
     var h='<tr><th>Company</th><th>ROIC</th><th>Rev growth '+(basis==="yoy"?"YoY":"QoQ")+'</th><th>Op margin (a.t.)</th><th>Asset turnover</th><th>P/E</th><th>Price</th><th>Mkt cap</th><th>Fundamentals as of</th></tr>';
     res.forEach(function(r,i){
       var row=BYT[r.t];
       if(!r.ok){
-        h+='<tr class="bad'+(i===0?" sel":"")+'"><td class="co"><b>'+esc(r.t)+'</b> <span>'+esc(r.name)+'</span></td><td colspan="8">data unavailable \u2014 '+esc(r.err||"fetch failed")+'</td></tr>';
+        h+='<tr class="bad'+(i===0?" sel":"")+'"><td class="co"><b>'+esc(r.t)+'</b> <span>'+esc(r.name)+'</span></td><td class="msg" colspan="8">data unavailable \u2014 '+esc(r.err||"fetch failed")+'</td></tr>';
         return;
       }
       h+='<tr'+(i===0?' class="sel"':'')+'>'
         + '<td class="co"><b>'+esc(r.t)+'</b> <span>'+esc(r.name)+'</span></td>'
-        + '<td>'+(r.nmFin?NM:fmtVal("pct",r.roic)+dv(r.flags.roic))+'</td>'
-        + '<td>'+fmtVal("pct",r[G])+dv(r.flags.g&&r[G]!=null)+(r.gPer?'<span class="asf">'+esc(r.gPer)+'</span>':'')+'</td>'
+        + '<td>'+((r.nmFin||r.nm.roic)?NM2(r.nmFin?"financial company":"negative invested capital"):fmtVal("pct",r.roic)+dv(r.flags.roic))+'</td>'
+        + '<td>'+fmtVal("pct",r[G])+dv(r.flags[G]&&r[G]!=null)+(r.gPer?'<span class="asf">'+esc(r.gPer)+'</span>':'')+'</td>'
         + '<td>'+(r.nmFin?NM:fmtVal("pct",r.opMargin)+dv(r.flags.om))+'</td>'
         + '<td>'+fmtVal("turn",r.turn)+dv(r.flags.f&&r.turn!=null)+'</td>'
-        + '<td>'+fmtVal("pe",r.pe)+dv(r.flags.pe&&r.pe!=null)+'</td>'
+        + '<td>'+(r.nm.pe?NM2("negative earnings"):fmtVal("pe",r.pe)+dv(r.flags.pe&&r.pe!=null))+'</td>'
         + '<td>$'+(r.px?r.px.toFixed(2):"\u2014")+'<span class="asf">'+esc(r.pxLive?"delayed live":"prior close "+fmtDate(U.asof))+'</span></td>'
         + '<td>'+(r.mcapLive?fmtMcap(r.mcapLive):fmtMcap(row[4]))+'</td>'
-        + '<td>'+esc(r.fMode==="FY"?"Latest FY":"TTM")+dv(r.flags.f)+'<span class="asf">'+(r.fEnd?("to "+fmtDate(r.fEnd)):"")+(r.flags.f?" \u00b7 Q4 derived from 10-K":"")+(r.notes&&r.notes.length?" \u00b7 "+esc(r.notes.join("; ")):"")+'</span></td>'
+        + '<td class="fnd">'+esc(r.fMode==="FY"?"Latest FY":"TTM")+dv(r.flags.f)+'<span class="asf">'+(r.fEnd?("to "+fmtDate(r.fEnd)):"")+(r.flags.f?" \u00b7 Q4 derived from 10-K":"")+(r.notes&&r.notes.length?" \u00b7 "+esc(r.notes.join("; ")):"")+'</span></td>'
         + '</tr>';
     });
     $("anTable").innerHTML=h;
