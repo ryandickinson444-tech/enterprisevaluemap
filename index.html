@@ -649,6 +649,7 @@
   #analysis .strip .dotm{position:absolute; top:6%; width:2px; height:88%; margin-left:-1px; background:#5B6B86}
   #analysis .strip .dots{position:absolute; top:50%; width:13px; height:13px; margin:-6.5px 0 0 -6.5px; background:var(--pri); border:2px solid #fff; border-radius:50%; box-shadow:0 0 0 1.5px var(--pri); z-index:2}
   #analysis .na{color:var(--muted); font-weight:650}
+  #analysis .dv{font-size:.72em; vertical-align:super; color:#8a6d00; margin-left:1px; font-weight:700}
 
   #analysis .cmp{margin-top:26px; overflow-x:auto}
   #analysis table.ct{border-collapse:collapse; width:100%; font-size:12.5px; min-width:820px}
@@ -1803,15 +1804,15 @@
   $("anYoY").addEventListener("click", function(){ basis="yoy"; $("anYoY").setAttribute("aria-pressed","true"); $("anQoQ").setAttribute("aria-pressed","false"); if(lastRun) renderResults(); });
   $("anQoQ").addEventListener("click", function(){ basis="qoq"; $("anQoQ").setAttribute("aria-pressed","true"); $("anYoY").setAttribute("aria-pressed","false"); if(lastRun) renderResults(); });
 
-  /* ---------- live data engine ----------
-     SEC states data.sec.gov does not send CORS headers, so a direct browser fetch
-     is normally blocked. We try direct first (future-proof), then fall back through
-     public CORS relays, and remember whichever route works for the rest of the session. */
+  /* ---------- live data engine (v2) ----------
+     Fundamentals come from SEC EDGAR's XBRL "companyfacts" file (one request per
+     company, every concept the company has ever filed), fetched through the personal
+     relay when configured. If that file is unavailable or very large, the engine
+     falls back to per-concept endpoints. Every tag candidate is examined and the tag
+     with the MOST RECENT filed data wins — never merely the first tag that exists.
+     Fourth quarters, which US filers never report directly, are derived from the
+     10-K (FY minus Q1–Q3) and flagged wherever they feed a figure. */
   var factsCache={}, quoteCache={};
-  /* Optional personal relay (e.g. a free Cloudflare Worker). If set, it is tried
-     FIRST for every request and makes the public relays below irrelevant.
-     Format: a URL prefix that takes the target URL as a ?url= parameter, e.g.
-     "https://evm-relay.yourname.workers.dev/?url=" */
   var MY_RELAY="https://evm-relay.ryandickinson444.workers.dev/?url=";
   var RELAYS=[
     function(u){ return u; },
@@ -1820,82 +1821,124 @@
     function(u){ return "https://api.codetabs.com/v1/proxy?quest="+encodeURIComponent(u); }
   ];
   if(MY_RELAY){ RELAYS.unshift(function(u){ return MY_RELAY+encodeURIComponent(u); }); }
+  /* Trusted routes pass EDGAR's own status codes through unchanged (a 404 really
+     means "no such filing/concept"). Public relays wrap or replace status codes, so
+     their 404s are treated as route failures instead. */
+  var TRUSTED=MY_RELAY?[0,1]:[0];
   var relayIdx={sec:0, px:0};
-  /* Circuit breaker: once a route fails this many times in a row for a given data
-     kind, stop wasting time on it for the rest of the session. A success resets it.
-     Without this, a dead-relay day means hundreds of doomed 10s-timeout attempts
-     and the run appears frozen at 0/N. */
   var ROUTE_DEAD_AT=4;
   var routeFails={sec:RELAYS.map(function(){return 0;}), px:RELAYS.map(function(){return 0;})};
-  function fetchJSON(kind, url, validate){
-    var start=relayIdx[kind], lastErr=null;
-    function attempt(i){
-      if(i>=RELAYS.length) return Promise.reject(lastErr||new Error("all routes failed"));
-      var k=(start+i)%RELAYS.length;
-      if(routeFails[kind][k]>=ROUTE_DEAD_AT) return attempt(i+1);
-      net.tried++;
-      var ctl=(typeof AbortController!=="undefined")?new AbortController():null;
-      var tm=ctl?setTimeout(function(){ ctl.abort(); },10000):null;
-      function done(){ if(tm) clearTimeout(tm); }
-      return fetch(RELAYS[k](url), ctl?{signal:ctl.signal}:{}).then(function(r){
-        if(!r.ok) throw new Error("HTTP "+r.status);
-        return r.json();
-      }).then(function(j){
-        if(validate && !validate(j)) throw new Error("bad payload from route "+k);
-        done(); relayIdx[kind]=k; routeFails[kind][k]=0; return j;
-      }).catch(function(e){ done(); routeFails[kind][k]++; lastErr=e; return attempt(i+1); });
-    }
-    return attempt(0);
+  var net={ok:0, tried:0};
+
+  /* SEC asks for no more than 10 requests per second; pace well under that. */
+  var RATE_PER_SEC=6, stamps=[];
+  function paced(){
+    var now=Date.now();
+    stamps=stamps.filter(function(t){ return now-t<1000; });
+    if(stamps.length<RATE_PER_SEC){ stamps.push(now); return Promise.resolve(); }
+    return sleep(1000-(now-stamps[0])+10).then(paced);
   }
-  /* Whole-company facts files run to tens of MB for large filers and choke public
-     relays. Fetch per-concept endpoints instead (tens of KB each) and assemble a
-     facts-shaped object; tag chains fall back across GAAP/IFRS variants. */
-  var net={ok:0, tried:0}, conceptCache={};
+  function sleep(ms){ return new Promise(function(res){ setTimeout(res, ms); }); }
+  function readCapped(r, maxBytes, ctl){
+    /* Stream the body so an unexpectedly huge file can be abandoned early. */
+    if(!r.body || !r.body.getReader) return r.text();
+    var reader=r.body.getReader(), dec=new TextDecoder(), parts=[], got=0;
+    function pump(){
+      return reader.read().then(function(x){
+        if(x.done){ parts.push(dec.decode()); return parts.join(""); }
+        got+=x.value.length;
+        if(got>maxBytes){ try{ ctl&&ctl.abort(); }catch(e){} var e2=new Error("too large"); e2.tooBig=true; throw e2; }
+        parts.push(dec.decode(x.value,{stream:true}));
+        return pump();
+      });
+    }
+    return pump();
+  }
+  function fetchJSON(kind, url, opt){
+    opt=opt||{};
+    var order=[], start=relayIdx[kind], lastErr=null;
+    for(var i=0;i<RELAYS.length;i++){ var k=(start+i)%RELAYS.length; if(!opt.routes || opt.routes.indexOf(k)>=0) order.push(k); }
+    function attempt(i, retry){
+      if(i>=order.length) return Promise.reject(lastErr||new Error("all routes failed"));
+      var k=order[i], trusted=TRUSTED.indexOf(k)>=0;
+      if(routeFails[kind][k]>=ROUTE_DEAD_AT) return attempt(i+1, 0);
+      return paced().then(function(){
+        net.tried++;
+        var ctl=(typeof AbortController!=="undefined")?new AbortController():null;
+        var tm=ctl?setTimeout(function(){ ctl.abort(); }, opt.timeout||10000):null;
+        function done(){ if(tm) clearTimeout(tm); }
+        return fetch(RELAYS[k](url), ctl?{signal:ctl.signal}:{}).then(function(r){
+          if(r.status===404 && trusted){ var nf=new Error("not found"); nf.notFound=true; throw nf; }
+          if(r.status===403 || r.status===429 || r.status>=500){ var re=new Error("HTTP "+r.status); re.retryable=true; throw re; }
+          if(!r.ok) throw new Error("HTTP "+r.status);
+          return opt.maxBytes ? readCapped(r, opt.maxBytes, ctl).then(function(t){ return JSON.parse(t); }) : r.json();
+        }).then(function(j){
+          if(opt.validate && !opt.validate(j)) throw new Error("bad payload from route "+k);
+          done(); relayIdx[kind]=k; routeFails[kind][k]=0; net.ok++; return j;
+        }).catch(function(e){
+          done();
+          if(e && e.notFound){ relayIdx[kind]=k; routeFails[kind][k]=0; net.ok++; return null; }
+          if(e && e.tooBig){ throw e; }
+          if(e && e.retryable && trusted && retry<2){ return sleep(1500*(retry+1)).then(function(){ return attempt(i, retry+1); }); }
+          routeFails[kind][k]++; lastErr=e; return attempt(i+1, 0);
+        });
+      });
+    }
+    return attempt(0, 0);
+  }
+
+  /* ---- tag chains (priority order; recency of data decides among those present) ---- */
+  var GAAP="us-gaap", IFRS="ifrs-full", DEI="dei";
+  var T_REV=[[GAAP,"Revenues"],[GAAP,"RevenueFromContractWithCustomerExcludingAssessedTax"],[GAAP,"RevenueFromContractWithCustomerIncludingAssessedTax"],[GAAP,"SalesRevenueNet"],[GAAP,"RevenuesNetOfInterestExpense"],[GAAP,"RegulatedAndUnregulatedOperatingRevenue"],[GAAP,"PremiumsEarnedNet"],[GAAP,"InterestAndDividendIncomeOperating"],[GAAP,"HealthCareOrganizationRevenue"],[GAAP,"OilAndGasRevenue"],[GAAP,"RealEstateRevenueNet"],[GAAP,"SalesRevenueGoodsNet"],[GAAP,"SalesRevenueServicesNet"],[IFRS,"Revenue"],[IFRS,"RevenueFromContractsWithCustomers"]];
+  var T_OPI=[[GAAP,"OperatingIncomeLoss"],[IFRS,"ProfitLossFromOperatingActivities"]];
+  var T_PRETAX=[[GAAP,"IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"],[GAAP,"IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments"],[GAAP,"IncomeLossFromContinuingOperationsBeforeIncomeTaxesDomestic"],[IFRS,"ProfitLossBeforeTax"]];
+  var T_TAX=[[GAAP,"IncomeTaxExpenseBenefit"],[IFRS,"IncomeTaxExpenseContinuingOperations"],[IFRS,"TaxExpense"]];
+  var T_INT=[[GAAP,"InterestExpense"],[GAAP,"InterestExpenseNonoperating"],[GAAP,"InterestExpenseDebt"],[GAAP,"InterestAndDebtExpense"],[IFRS,"InterestExpense"]];
+  var T_ASSETS=[[GAAP,"Assets"],[IFRS,"Assets"]];
+  var T_EQ=[[GAAP,"StockholdersEquity"],[GAAP,"StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"],[IFRS,"Equity"],[IFRS,"EquityAttributableToOwnersOfParent"]];
+  var T_CASH=[[GAAP,"CashAndCashEquivalentsAtCarryingValue"],[GAAP,"CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"],[IFRS,"CashAndCashEquivalents"]];
+  var T_DEBT_L=[[GAAP,"LongTermDebtNoncurrent"],[GAAP,"LongTermDebtAndCapitalLeaseObligations"],[GAAP,"LongTermDebt"],[GAAP,"DebtLongtermAndShorttermCombinedAmount"],[IFRS,"NoncurrentBorrowings"]];
+  var T_DEBT_C=[[GAAP,"LongTermDebtCurrent"],[GAAP,"LongTermDebtAndCapitalLeaseObligationsCurrent"],[GAAP,"DebtCurrent"],[GAAP,"ShortTermBorrowings"],[GAAP,"CommercialPaper"],[IFRS,"CurrentBorrowings"]];
+  var T_EPS=[[GAAP,"EarningsPerShareDiluted"],[GAAP,"EarningsPerShareBasicAndDiluted"],[IFRS,"DilutedEarningsLossPerShare"],[GAAP,"EarningsPerShareBasic"],[IFRS,"BasicEarningsLossPerShare"]];
+  var T_SHARES=[[DEI,"EntityCommonStockSharesOutstanding"]];
+  var ALL_CHAINS=[T_REV,T_OPI,T_PRETAX,T_TAX,T_INT,T_ASSETS,T_EQ,T_CASH,T_DEBT_L,T_DEBT_C,T_EPS,T_SHARES];
+
+  /* ---- facts acquisition ---- */
   var inflight=0, waiters=[];
   function gate(){ if(inflight<6){ inflight++; return Promise.resolve(); } return new Promise(function(res){ waiters.push(res); }); }
   function ungate(){ inflight--; var w=waiters.shift(); if(w){ inflight++; w(); } }
+  var conceptCache={};
   function getConcept(cik, tx, tg){
     var key=cik+"/"+tx+"/"+tg;
     if(conceptCache[key]!==undefined) return Promise.resolve(conceptCache[key]);
     return gate().then(function(){
-      return fetchJSON("sec","https://data.sec.gov/api/xbrl/companyconcept/CIK"+cik+"/"+tx+"/"+tg+".json",
-          function(j){ return j && j.units; })
-        .then(function(j){ ungate(); net.ok++; conceptCache[key]=j; return j; })
+      return fetchJSON("sec","https://data.sec.gov/api/xbrl/companyconcept/CIK"+cik+"/"+tx+"/"+tg+".json",{validate:function(j){ return j && j.units; }})
+        .then(function(j){ ungate(); conceptCache[key]=j||null; return j||null; })
         .catch(function(e){ ungate(); conceptCache[key]=null; return null; });
     });
   }
-  function resolveSlot(cik, chain){
-    var i=0;
-    function tryNext(){
-      if(i>=chain.length) return Promise.resolve(null);
-      var tx=chain[i][0], tg=chain[i][1]; i++;
-      return getConcept(cik, tx, tg).then(function(j){
-        if(j && j.units) return {tx:tx, tg:tg, units:j.units};
-        return tryNext();
-      });
-    }
-    return tryNext();
+  function conceptFallback(cik){
+    var jobs=[];
+    ALL_CHAINS.forEach(function(ch){ ch.forEach(function(tt){ jobs.push(getConcept(cik, tt[0], tt[1]).then(function(j){ return j?{tx:tt[0],tg:tt[1],units:j.units}:null; })); }); });
+    return Promise.all(jobs).then(function(rs){
+      var facts={facts:{}, _src:"per-concept"}, any=false;
+      rs.forEach(function(r){ if(!r) return; any=true; if(!facts.facts[r.tx]) facts.facts[r.tx]={}; facts.facts[r.tx][r.tg]={units:r.units}; });
+      if(!any) throw new Error(net.ok ? "no SEC financial data found for this filer" : "could not reach SEC EDGAR");
+      return facts;
+    });
   }
   function getFacts(cik){
     if(factsCache[cik]) return Promise.resolve(factsCache[cik]);
-    var SLOTS=[T_REV,T_OPI,T_PRETAX,T_TAX,T_ASSETS,T_EQ,T_CASH,T_DEBT_L,T_DEBT_C,T_EPS,T_SHARES];
-    return Promise.all(SLOTS.map(function(ch){ return resolveSlot(cik, ch); }))
-      .then(function(rs){
-        var facts={facts:{}};
-        rs.forEach(function(r){
-          if(!r) return;
-          if(!facts.facts[r.tx]) facts.facts[r.tx]={};
-          facts.facts[r.tx][r.tg]={units:r.units};
-        });
-        var any=false, k; for(k in facts.facts){ any=true; break; }
-        if(!any) throw new Error(net.ok ? "no SEC data found" : "all routes failed");
-        factsCache[cik]=facts; return facts;
-      });
+    return fetchJSON("sec","https://data.sec.gov/api/xbrl/companyfacts/CIK"+cik+".json",
+        {validate:function(j){ return j && j.facts; }, timeout:60000, maxBytes:45e6, routes:TRUSTED})
+      .then(function(j){ if(j){ j._src="companyfacts"; return j; } throw new Error("EDGAR has no XBRL financial data for this filer"); },
+            function(e){ return conceptFallback(cik); })
+      .then(function(f){ factsCache[cik]=f; return f; });
   }
   function getQuote(t){
     if(quoteCache[t]) return Promise.resolve(quoteCache[t]);
     return fetchJSON("px","https://cdn.cboe.com/api/global/delayed_quotes/quotes/"+encodeURIComponent(t.replace("/","."))+".json",
-        function(j){ return j && j.data; })
+        {validate:function(j){ return j && j.data; }})
       .then(function(j){
         var d=j&&j.data, px=d&&(d.current_price||d.close||d.prev_day_close);
         var q={px:(px&&px>0)?px:null, ts:(d&&(d.last_trade_time||d.tick))||null, live:!!(px&&px>0)};
@@ -1904,18 +1947,20 @@
       .catch(function(){ var q={px:null, ts:null, live:false}; quoteCache[t]=q; return q; });
   }
 
-  /* facts helpers */
-  function series(facts, taxTag){
-    for(var i=0;i<taxTag.length;i++){
-      var tx=taxTag[i][0], tg=taxTag[i][1];
-      var node=facts.facts && facts.facts[tx] && facts.facts[tx][tg];
-      if(!node || !node.units) continue;
-      var un=node.units.USD || node.units[Object.keys(node.units)[0]];
-      if(un && un.length) return un;
-    }
-    return null;
-  }
+  /* ---- series helpers ---- */
   function days(a,b){ return (new Date(b)-new Date(a))/864e5; }
+  function addDays(iso,n){ var d=new Date(iso); d.setUTCDate(d.getUTCDate()+n); return d.toISOString().slice(0,10); }
+  function near(a,b,tol){ return Math.abs(days(a,b))<=tol; }
+  function unitsOf(node, kind){
+    if(!node||!node.units) return null;
+    var keys=Object.keys(node.units), key=null;
+    if(kind==="eps") key=keys.filter(function(k){ return /USD\/shares/i.test(k); })[0]||keys.filter(function(k){ return /shares/i.test(k); })[0];
+    else if(kind==="shares") key=keys.filter(function(k){ return /^shares$/i.test(k); })[0];
+    else key=node.units.USD?"USD":null;
+    if(!key) key=keys[0];
+    var un=node.units[key];
+    return (un&&un.length)?{u:un,cur:key}:null;
+  }
   function durSeries(un){
     if(!un) return [];
     var best={};
@@ -1931,29 +1976,70 @@
   function instSeries(un){
     if(!un) return [];
     var best={};
-    un.forEach(function(e){ if(!e.end || e.val==null) return; if(!best[e.end] || e.filed>best[e.end].filed) best[e.end]=e; });
+    un.forEach(function(e){ if(!e.end || e.val==null || e.start) return; if(!best[e.end] || e.filed>best[e.end].filed) best[e.end]=e; });
     var out=Object.keys(best).map(function(k){ return best[k]; });
     out.sort(function(a,b){ return a.end<b.end?-1:1; });
     return out;
   }
-  function pickBuckets(ds){
-    var q=ds.filter(function(e){ var d=days(e.start,e.end); return d>=70&&d<=100; });
-    var h=ds.filter(function(e){ var d=days(e.start,e.end); return d>=168&&d<=196; });
-    var y=ds.filter(function(e){ var d=days(e.start,e.end); return d>=350&&d<=380; });
-    return {q:q,h:h,y:y};
+  /* Among every candidate tag the company has actually filed, choose the one whose
+     data reaches the most recent period; chain order only breaks ties. */
+  function pickSeries(facts, chain, mode, kind){
+    var best=null;
+    chain.forEach(function(tt, idx){
+      var node=facts.facts && facts.facts[tt[0]] && facts.facts[tt[0]][tt[1]];
+      var U=unitsOf(node, kind); if(!U) return;
+      var s=(mode==="dur")?durSeries(U.u):instSeries(U.u);
+      if(!s.length) return;
+      var latest=s[s.length-1].end;
+      if(!best || latest>best.latest || (latest===best.latest && idx<best.idx)) best={s:s, latest:latest, idx:idx, tag:tt[1], cur:U.cur};
+    });
+    return best;
   }
-  function ttmOf(b){
-    /* prefer 4 most-recent contiguous-ish quarters; else 2 halves; else latest FY */
-    if(b.q.length>=4){
-      var last4=b.q.slice(-4), s=0; last4.forEach(function(e){ s+=e.val; });
-      var span=days(last4[0].start,last4[3].end);
-      if(span>330 && span<400) return {val:s, start:last4[0].start, end:last4[3].end, mode:"TTM (4 qtrs)"};
+  function isQ(e){ var d=days(e.start,e.end); return d>=70&&d<=100; }
+  function isFY(e){ var d=days(e.start,e.end); return d>=350&&d<=380; }
+  function is9M(e){ var d=days(e.start,e.end); return d>=250&&d<=290; }
+  function contiguous(list){ for(var i=1;i<list.length;i++){ if(!near(addDays(list[i-1].end,1), list[i].start, 6)) return false; } return true; }
+  /* US filers report Q1–Q3 in 10-Qs and the full year in the 10-K; Q4 must be
+     derived. Also works from a 9-month YTD figure when individual quarters are absent. */
+  function deriveQuarters(ds){
+    var q=ds.filter(isQ), y=ds.filter(isFY), nine=ds.filter(is9M), out=q.slice();
+    y.forEach(function(fy){
+      if(q.some(function(e){ return e.end===fy.end; })) return;
+      var inside=q.filter(function(e){ return days(fy.start,e.start)>=-6 && e.end<=fy.end; });
+      var sum=null, lastEnd=null;
+      if(inside.length===3 && contiguous(inside) && near(inside[0].start, fy.start, 6)){ sum=inside[0].val+inside[1].val+inside[2].val; lastEnd=inside[2].end; }
+      else{
+        var n9=nine.filter(function(e){ return near(e.start, fy.start, 6) && e.end<fy.end; });
+        if(n9.length){ var e9=n9[n9.length-1]; sum=e9.val; lastEnd=e9.end; }
+      }
+      if(sum==null) return;
+      var q4={start:addDays(lastEnd,1), end:fy.end, val:fy.val-sum, filed:fy.filed, derived:true};
+      if(isQ(q4)) out.push(q4);
+    });
+    out.sort(function(a,b){ return a.end<b.end?-1:a.end>b.end?1:0; });
+    return out;
+  }
+  function ttmOf(ds){
+    if(!ds || !ds.length) return null;
+    var qs=deriveQuarters(ds), y=ds.filter(isFY);
+    var lq=qs.length?qs[qs.length-1]:null, ly=y.length?y[y.length-1]:null;
+    if(ly && (!lq || ly.end>=lq.end)) return {val:ly.val, start:ly.start, end:ly.end, mode:"FY", derived:false};
+    if(qs.length>=4){
+      var l4=qs.slice(-4), span=days(l4[0].start,l4[3].end);
+      if(contiguous(l4) && span>330 && span<400){
+        var s=0, dv=false; l4.forEach(function(e){ s+=e.val; if(e.derived) dv=true; });
+        return {val:s, start:l4[0].start, end:l4[3].end, mode:"TTM", derived:dv};
+      }
     }
-    if(b.h.length>=2){
-      var l2=b.h.slice(-2), s2=l2[0].val+l2[1].val, sp=days(l2[0].start,l2[1].end);
-      if(sp>330&&sp<400) return {val:s2, start:l2[0].start, end:l2[1].end, mode:"TTM (2 halves)"};
+    if(ly && lq){
+      var ytd=ds.filter(function(e){ return near(e.start, addDays(ly.end,1), 6) && e.end===lq.end; })[0];
+      if(ytd){
+        var len=days(ytd.start,ytd.end);
+        var prior=ds.filter(function(e){ return near(e.start, ly.start, 6) && Math.abs(days(e.start,e.end)-len)<=8; })[0];
+        if(prior) return {val:ly.val+ytd.val-prior.val, start:addDays(prior.end,1), end:ytd.end, mode:"TTM", derived:true};
+      }
     }
-    if(b.y.length) { var fy=b.y[b.y.length-1]; return {val:fy.val, start:fy.start, end:fy.end, mode:"latest FY"}; }
+    if(ly) return {val:ly.val, start:ly.start, end:ly.end, mode:"FY", derived:false};
     return null;
   }
   function valAsOf(inst, end){
@@ -1964,110 +2050,112 @@
     return pick || inst[inst.length-1];
   }
   function nearYearAgo(inst, end){
-    var t=new Date(end); t.setDate(t.getDate()-365);
-    var best=null, bd=1e9;
-    inst.forEach(function(e){ var d=Math.abs((new Date(e.end)-t)/864e5); if(d<bd){bd=d;best=e;} });
-    return (best && bd<120) ? best : null;
+    var t=addDays(end,-365), best=null, bd=1e9;
+    inst.forEach(function(e){ var d=Math.abs(days(e.end,t)); if(d<bd){ bd=d; best=e; } });
+    return (best && bd<45) ? best : null;
   }
-
-  var GAAP="us-gaap", IFRS="ifrs-full", DEI="dei";
-  var T_REV=[[GAAP,"RevenueFromContractWithCustomerExcludingAssessedTax"],[GAAP,"Revenues"],[GAAP,"SalesRevenueNet"],[GAAP,"RevenueFromContractWithCustomerIncludingAssessedTax"],[GAAP,"RevenuesNetOfInterestExpense"],[IFRS,"Revenue"],[IFRS,"RevenueFromContractsWithCustomers"]];
-  var T_OPI=[[GAAP,"OperatingIncomeLoss"],[IFRS,"ProfitLossFromOperatingActivities"]];
-  var T_PRETAX=[[GAAP,"IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"],[GAAP,"IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments"],[IFRS,"ProfitLossBeforeTax"]];
-  var T_TAX=[[GAAP,"IncomeTaxExpenseBenefit"],[IFRS,"IncomeTaxExpenseContinuingOperations"],[IFRS,"TaxExpense"]];
-  var T_ASSETS=[[GAAP,"Assets"],[IFRS,"Assets"]];
-  var T_EQ=[[GAAP,"StockholdersEquity"],[GAAP,"StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"],[IFRS,"Equity"],[IFRS,"EquityAttributableToOwnersOfParent"]];
-  var T_CASH=[[GAAP,"CashAndCashEquivalentsAtCarryingValue"],[GAAP,"CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"],[IFRS,"CashAndCashEquivalents"]];
-  var T_EPS=[[GAAP,"EarningsPerShareDiluted"],[GAAP,"EarningsPerShareBasicAndDiluted"],[IFRS,"DilutedEarningsLossPerShare"],[GAAP,"EarningsPerShareBasic"],[IFRS,"BasicEarningsLossPerShare"]];
-  var T_DEBT_L=[[GAAP,"LongTermDebtNoncurrent"],[GAAP,"LongTermDebt"],[IFRS,"NoncurrentBorrowings"]] ;
-  var T_DEBT_C=[[GAAP,"LongTermDebtCurrent"],[GAAP,"DebtCurrent"],[GAAP,"ShortTermBorrowings"],[IFRS,"CurrentBorrowings"]];
-  var T_SHARES=[[DEI,"EntityCommonStockSharesOutstanding"]];
-
-  function epsSeries(facts){
-    for(var i=0;i<T_EPS.length;i++){
-      var tx=T_EPS[i][0], tg=T_EPS[i][1];
-      var node=facts.facts && facts.facts[tx] && facts.facts[tx][tg];
-      if(!node||!node.units) continue;
-      var key=Object.keys(node.units).filter(function(k){ return /shares?/i.test(k)||/USD\//.test(k); })[0]||Object.keys(node.units)[0];
-      var un=node.units[key];
-      if(un&&un.length) return un;
-    }
-    return null;
-  }
+  function monthsAgo(iso){ return days(iso, new Date().toISOString().slice(0,10))/30.4; }
 
   function computeMetrics(row, facts, quote){
-    var out={t:row[0], name:row[1], ok:true, notes:[]};
+    var out={t:row[0], name:row[1], ok:true, notes:[], flags:{}, src:facts._src||""};
+    var fin=(row[3]==="Finance");
     try{
-      var rev=pickBuckets(durSeries(series(facts,T_REV)));
-      var opi=pickBuckets(durSeries(series(facts,T_OPI)));
-      var pre=pickBuckets(durSeries(series(facts,T_PRETAX)));
-      var tax=pickBuckets(durSeries(series(facts,T_TAX)));
-      var eps=pickBuckets(durSeries(epsSeries(facts)||[]));
-      var assets=instSeries(series(facts,T_ASSETS));
-      var eq=instSeries(series(facts,T_EQ));
-      var cash=instSeries(series(facts,T_CASH));
-      var dl=instSeries(series(facts,T_DEBT_L));
-      var dc=instSeries(series(facts,T_DEBT_C));
-
-      var revTTM=ttmOf(rev);
-      if(!revTTM) throw new Error("no revenue data");
-      out.fEnd=revTTM.end; out.fMode=revTTM.mode;
+      var R=pickSeries(facts,T_REV,"dur","usd");
+      if(!R) throw new Error("no revenue concept in this filer\u2019s XBRL");
+      var revTTM=ttmOf(R.s);
+      if(!revTTM) throw new Error("revenue periods could not be assembled");
+      if(monthsAgo(revTTM.end)>18) throw new Error("latest SEC financial data ends "+fmtDate(revTTM.end));
+      out.fEnd=revTTM.end; out.fMode=revTTM.mode; out.revTag=R.tag;
+      if(revTTM.derived) out.flags.f=true;
+      if(monthsAgo(revTTM.end)>9) out.notes.push("latest filing data is "+Math.round(monthsAgo(revTTM.end))+" months old");
+      if(R.cur!=="USD") out.notes.push("reported in "+R.cur);
+      var foreign = R.s.some(function(e){ return /^(20|40)-F/.test(e.form||""); });
 
       /* growth */
-      if(rev.q.length>=2){
-        var qs=rev.q, ql=qs[qs.length-1];
-        out.qoq=(ql.val/qs[qs.length-2].val)-1;
-        var ya=null;
-        qs.forEach(function(e){ var d=Math.abs(days(e.end,ql.end)-365); if(d<45 && (!ya||Math.abs(days(e.end,ql.end)-365)<Math.abs(days(ya.end,ql.end)-365))) ya=e; });
-        if(ya) out.yoy=(ql.val/ya.val)-1;
+      var qs=deriveQuarters(R.s), y=R.s.filter(isFY);
+      if(qs.length){
+        var ql=qs[qs.length-1], prev=qs.length>1?qs[qs.length-2]:null;
+        if(prev && near(addDays(prev.end,1), ql.start, 6) && prev.val>0){ out.qoq=ql.val/prev.val-1; if(ql.derived||prev.derived) out.flags.g=true; }
+        var ya=null, target=addDays(ql.end,-365);
+        qs.forEach(function(e){ if(near(e.end,target,20) && (!ya || Math.abs(days(e.end,target))<Math.abs(days(ya.end,target)))) ya=e; });
+        if(ya && ya.val>0){ out.yoy=ql.val/ya.val-1; if(ql.derived||ya.derived) out.flags.g=true; }
         out.gEnd=ql.end; out.gPer="Q ended "+fmtDate(ql.end);
       }
-      if(out.yoy===undefined && rev.y.length>=2){
-        var ys=rev.y;
-        out.yoy=(ys[ys.length-1].val/ys[ys.length-2].val)-1;
+      if(out.yoy===undefined && y.length>=2){
+        var ys=y; if(ys[ys.length-2].val>0){ out.yoy=ys[ys.length-1].val/ys[ys.length-2].val-1; }
         out.gEnd=ys[ys.length-1].end; out.gPer="FY ended "+fmtDate(ys[ys.length-1].end);
         if(out.qoq===undefined) out.notes.push("annual filer \u2014 QoQ n/a");
       }
 
-      /* after-tax operating margin + NOPAT */
-      var opiTTM=ttmOf(opi), preTTM=ttmOf(pre), taxTTM=ttmOf(tax);
-      var rate=0.21;
-      if(preTTM && taxTTM && preTTM.val>0){ rate=Math.min(0.5, Math.max(0, taxTTM.val/preTTM.val)); }
+      /* tax rate */
+      var P=pickSeries(facts,T_PRETAX,"dur","usd"), X=pickSeries(facts,T_TAX,"dur","usd");
+      var preTTM=P?ttmOf(P.s):null, taxTTM=X?ttmOf(X.s):null, rate=0.21;
+      if(preTTM && taxTTM && preTTM.val>0) rate=Math.min(0.5, Math.max(0, taxTTM.val/preTTM.val));
+      else out.notes.push("statutory 21% tax rate assumed");
       out.taxRate=rate;
-      if(opiTTM){ out.opMargin=(opiTTM.val*(1-rate))/revTTM.val; out.nopat=opiTTM.val*(1-rate); }
 
-      /* asset turnover: TTM revenue / avg total assets */
-      var aNow=valAsOf(assets,null), aAgo=aNow?nearYearAgo(assets,aNow.end):null;
-      if(aNow){
-        var avgA=aAgo?(aNow.val+aAgo.val)/2:aNow.val;
-        out.turn=revTTM.val/avgA; out.aEnd=aNow.end;
+      /* operating income (or EBIT proxy), NOPAT, after-tax margin */
+      if(fin){
+        out.nmFin=true; out.notes.push("financial company \u2014 operating margin & ROIC not meaningful");
+      }else{
+        var O=pickSeries(facts,T_OPI,"dur","usd"), opiTTM=O?ttmOf(O.s):null, ebit=null;
+        if(opiTTM){ ebit=opiTTM; }
+        else if(preTTM){
+          var I=pickSeries(facts,T_INT,"dur","usd"), intTTM=I?ttmOf(I.s):null;
+          ebit={val:preTTM.val+(intTTM?intTTM.val:0), end:preTTM.end, derived:true};
+          out.flags.ebit=true;
+          out.notes.push(intTTM ? "no operating-income tag \u2014 EBIT = pretax income + interest expense" : "no operating-income or interest tag \u2014 pretax income used as EBIT");
+        }
+        if(ebit){
+          out.nopat=ebit.val*(1-rate); out.opMargin=out.nopat/revTTM.val;
+          if(ebit.derived) out.flags.om=true;
+        }else out.notes.push("no operating or pretax income tag");
       }
+
+      /* asset turnover */
+      var A=pickSeries(facts,T_ASSETS,"inst","usd");
+      if(A){
+        var aNow=valAsOf(A.s,null), aAgo=nearYearAgo(A.s,aNow.end);
+        var avgA=aAgo?(aNow.val+aAgo.val)/2:aNow.val;
+        if(avgA>0){ out.turn=revTTM.val/avgA; out.aEnd=aNow.end; if(!aAgo) out.notes.push("asset turnover uses latest assets (no year-ago figure)"); }
+      }else out.notes.push("no total-assets tag");
 
       /* ROIC */
-      function icAt(end){
-        var e=valAsOf(eq,end); if(!e) return null;
-        var c=valAsOf(cash,end), l=valAsOf(dl,end), s=valAsOf(dc,end);
-        return e.val + (l?l.val:0) + (s?s.val:0) - (c?c.val:0);
-      }
-      if(out.nopat!==undefined && eq.length){
-        var eNow=valAsOf(eq,null);
-        var icN=icAt(eNow.end), eAgo=nearYearAgo(eq,eNow.end);
-        var icA=eAgo?icAt(eAgo.end):null;
-        var ic=(icN&&icA)?(icN+icA)/2:icN;
-        if(ic && ic>0){ out.roic=out.nopat/ic; out.icEnd=eNow.end; }
+      if(!fin && out.nopat!==undefined){
+        var E=pickSeries(facts,T_EQ,"inst","usd"), C=pickSeries(facts,T_CASH,"inst","usd");
+        var DL=pickSeries(facts,T_DEBT_L,"inst","usd"), DC=pickSeries(facts,T_DEBT_C,"inst","usd");
+        if(E){
+          function icAt(end){
+            var e=valAsOf(E.s,end); if(!e) return null;
+            var c=C?valAsOf(C.s,end):null, l=DL?valAsOf(DL.s,end):null, s=DC?valAsOf(DC.s,end):null;
+            return e.val+(l?l.val:0)+(s?s.val:0)-(c?c.val:0);
+          }
+          var eNow=valAsOf(E.s,null), icN=icAt(eNow.end), eAgo=nearYearAgo(E.s,eNow.end), icA=eAgo?icAt(eAgo.end):null;
+          var ic=(icN!=null&&icA!=null)?(icN+icA)/2:icN;
+          if(!DL && !DC) out.notes.push("no debt tags found \u2014 invested capital = equity \u2212 cash");
+          if(ic!=null && ic>0){ out.roic=out.nopat/ic; out.icEnd=eNow.end; if(out.flags.om) out.flags.roic=true; }
+          else out.notes.push("negative invested capital \u2014 ROIC n/m");
+        }else out.notes.push("no equity tag \u2014 ROIC n/a");
       }
 
       /* earnings multiple */
-      var epsTTM=ttmOf(eps);
+      var EP=pickSeries(facts,T_EPS,"dur","eps"), epsTTM=EP?ttmOf(EP.s):null;
       var px=(quote&&quote.live&&quote.px)?quote.px:row[5];
       out.px=px; out.pxLive=!!(quote&&quote.live);
       out.pxAsOf=out.pxLive?(quote.ts?String(quote.ts):"delayed quote"):("close "+fmtDate(U.asof));
-      if(epsTTM && epsTTM.val>0){ out.pe=px/epsTTM.val; out.peEnd=epsTTM.end; }
+      var epsUSD = EP && /^USD\//i.test(EP.cur);
+      if(foreign || (EP && !epsUSD)){
+        out.pe=null; out.notes.push(foreign ? "foreign filer (20-F/40-F) \u2014 P/E n/a (ADR ratio)" : "EPS reported in "+EP.cur+" \u2014 P/E n/a");
+      }
+      else if(epsTTM && epsTTM.val>0){ out.pe=px/epsTTM.val; out.peEnd=epsTTM.end; if(epsTTM.derived) out.flags.pe=true; }
       else if(epsTTM){ out.pe=null; out.notes.push("negative EPS \u2014 multiple n/m"); }
+      else out.notes.push("no EPS tag \u2014 P/E n/a");
 
-      var sh=instSeries(series(facts,T_SHARES));
-      var shNow=sh.length?sh[sh.length-1]:null;
-      if(shNow) out.mcapLive=px*shNow.val;
+      if(!foreign && R.cur==="USD"){
+        var S=pickSeries(facts,T_SHARES,"inst","shares");
+        var shNow=S?valAsOf(S.s,null):null;
+        if(shNow && shNow.val>0) out.mcapLive=px*shNow.val;
+      }
     }catch(err){
       out.ok=false; out.err=err.message||"parse error";
     }
@@ -2173,7 +2261,7 @@
     /* apex */
     var roics=ok.map(function(r){ return r.roic; }).filter(function(v){ return v!=null&&isFinite(v); });
     var peerRoics=ok.slice(0).filter(function(r){return r!==mine;}).map(function(r){return r.roic;}).filter(function(v){return v!=null&&isFinite(v);});
-    $("mApexBig").innerHTML = mine.ok ? fmtVal("pct",mine.roic) : '<span class="na">n/a</span>';
+    $("mApexBig").innerHTML = mine.ok ? (mine.nmFin ? '<span class="na" title="financial company \u2014 not meaningful">n/m</span>' : fmtVal("pct",mine.roic)) : '<span class="na">n/a</span>';
     $("mApexMed").textContent = peerRoics.length? ("peer median "+pct(median(peerRoics))+(mine.ok&&mine.roic!=null?(" \u00b7 "+ord(rankOf(mine.roic,roics,true))+" of "+roics.length):"")) : "";
 
     var cards="";
@@ -2183,7 +2271,7 @@
       var mv=mine.ok?mine[M.key]:null;
       var all=vals.filter(function(v){return v!=null&&isFinite(v);});
       cards+='<div class="mcard"><div class="mchd"><div class="t">'+M.t+'</div><div class="m">'+M.m+'</div></div>'
-        + '<div class="big">'+fmtVal(M.kind,mv)+'</div>'
+        + '<div class="big">'+((mine.ok&&mine.nmFin&&M.k==="om")?'<span class="na" title="financial company \u2014 not meaningful">n/m</span>':fmtVal(M.kind,mv))+'</div>'
         + '<div class="med">'+(pvals.length?("peer median "+fmtVal(M.kind,median(pvals))):"no peer data")+'</div>'
         + strip(all, (mv!=null&&isFinite(mv))?mv:null)
         + '<div class="rank">'+((mv!=null&&isFinite(mv)&&all.length>1)?(ord(rankOf(mv,all,M.hi))+" of "+all.length):"")+'</div>'
@@ -2192,6 +2280,8 @@
     $("anCards").innerHTML=cards;
 
     /* table */
+    var NM='<span class="na" title="financial company \u2014 not meaningful">n/m</span>';
+    function dv(on){ return on?'<span class="dv" title="includes a derived figure \u2014 see notes">\u2020</span>':''; }
     var h='<tr><th>Company</th><th>ROIC</th><th>Rev growth '+(basis==="yoy"?"YoY":"QoQ")+'</th><th>Op margin (a.t.)</th><th>Asset turnover</th><th>P/E</th><th>Price</th><th>Mkt cap</th><th>Fundamentals as of</th></tr>';
     res.forEach(function(r,i){
       var row=BYT[r.t];
@@ -2201,24 +2291,24 @@
       }
       h+='<tr'+(i===0?' class="sel"':'')+'>'
         + '<td class="co"><b>'+esc(r.t)+'</b> <span>'+esc(r.name)+'</span></td>'
-        + '<td>'+fmtVal("pct",r.roic)+'</td>'
-        + '<td>'+fmtVal("pct",r[G])+(r.gPer?'<span class="asf">'+esc(r.gPer)+'</span>':'')+'</td>'
-        + '<td>'+fmtVal("pct",r.opMargin)+'</td>'
-        + '<td>'+fmtVal("turn",r.turn)+'</td>'
-        + '<td>'+fmtVal("pe",r.pe)+'</td>'
+        + '<td>'+(r.nmFin?NM:fmtVal("pct",r.roic)+dv(r.flags.roic))+'</td>'
+        + '<td>'+fmtVal("pct",r[G])+dv(r.flags.g&&r[G]!=null)+(r.gPer?'<span class="asf">'+esc(r.gPer)+'</span>':'')+'</td>'
+        + '<td>'+(r.nmFin?NM:fmtVal("pct",r.opMargin)+dv(r.flags.om))+'</td>'
+        + '<td>'+fmtVal("turn",r.turn)+dv(r.flags.f&&r.turn!=null)+'</td>'
+        + '<td>'+fmtVal("pe",r.pe)+dv(r.flags.pe&&r.pe!=null)+'</td>'
         + '<td>$'+(r.px?r.px.toFixed(2):"\u2014")+'<span class="asf">'+esc(r.pxLive?"delayed live":"prior close "+fmtDate(U.asof))+'</span></td>'
         + '<td>'+(r.mcapLive?fmtMcap(r.mcapLive):fmtMcap(row[4]))+'</td>'
-        + '<td>'+esc(r.fMode||"")+'<span class="asf">'+(r.fEnd?("to "+fmtDate(r.fEnd)):"")+(r.notes&&r.notes.length?" \u00b7 "+esc(r.notes.join("; ")):"")+'</span></td>'
+        + '<td>'+esc(r.fMode==="FY"?"Latest FY":"TTM")+dv(r.flags.f)+'<span class="asf">'+(r.fEnd?("to "+fmtDate(r.fEnd)):"")+(r.flags.f?" \u00b7 Q4 derived from 10-K":"")+(r.notes&&r.notes.length?" \u00b7 "+esc(r.notes.join("; ")):"")+'</span></td>'
         + '</tr>';
     });
     $("anTable").innerHTML=h;
 
     $("anNote").innerHTML =
-      '<b>Definitions & sources.</b> Fundamentals are fetched live from SEC EDGAR (per-concept XBRL API) at the moment you run the analysis; each row shows the period covered (trailing twelve months where quarterly data exists, otherwise the latest annual filing \u2014 common for foreign filers). '
+      '<b>Definitions & sources.</b> Fundamentals are fetched live from SEC EDGAR (XBRL company-facts API) at the moment you run the analysis; each row shows the period covered \u2014 trailing twelve months where quarterly filings exist, otherwise the latest annual filing (common for foreign filers). Where several XBRL tags could supply a figure, the tag with the most recently filed data is used. US companies do not file a stand-alone fourth quarter, so Q4 is derived as full year minus Q1\u2013Q3; the \u2020 marker flags any figure that includes a derived quarter or a proxy (e.g. EBIT = pretax income + interest expense when no operating-income tag is filed). Operating margin and ROIC are shown as n/m for financial companies, whose income statements do not report operating income comparably. P/E is not computed for foreign filers (20-F/40-F) because ADR share ratios and reporting currencies differ from the listed security. '
       + 'ROIC = after-tax operating income (NOPAT, using each company\u2019s effective tax rate) \u00f7 average invested capital (total equity + total debt \u2212 cash). '
       + 'Operating margin (after taxes) = NOPAT \u00f7 revenue. Gross asset turnover = TTM revenue \u00f7 average total assets. '
       + 'Earnings multiple = share price \u00f7 trailing diluted EPS (n/m when EPS \u2264 0). '
-      + 'Because SEC\u2019s API does not allow direct browser access, requests may travel via a public relay (allorigins / corsproxy). Prices: Cboe delayed quotes when reachable, otherwise the '+fmtDate(U.asof)+' close embedded in this file; the ticker list, industries and market-cap ordering are also from the '+fmtDate(U.asof)+' snapshot. Figures are for discussion, not investment advice.';
+      + 'Requests travel through the InsightMaps relay (public relays as fallback). Prices: Cboe delayed quotes when reachable, otherwise the '+fmtDate(U.asof)+' close embedded in this file; the ticker list, industries and market-cap ordering are also from the '+fmtDate(U.asof)+' snapshot. Figures are for discussion, not investment advice.';
     $("anRes").classList.add("on");
     $("anRes").scrollIntoView({behavior:"smooth", block:"nearest"});
   }
