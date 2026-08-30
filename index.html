@@ -638,6 +638,7 @@
   #analysis .mcard{background:#fff; border:2px solid var(--enab-b); width:240px; flex:1 1 220px; max-width:255px; padding:0 0 12px}
   #analysis .mcard .mchd{background:var(--perf); color:#fff; padding:9px 12px; min-height:70px; box-sizing:border-box}
   #analysis .mcard.apx .mchd{background:var(--apex)}
+  #analysis .mapex .apxsub{margin-top:10px; padding-top:8px; border-top:1px solid rgba(255,255,255,.28)}
   #analysis .mcard .mchd .t{font-family:var(--serif); font-weight:750; font-size:14.5px; line-height:1.2}
   #analysis .mcard .mchd .m{font-size:10px; letter-spacing:.09em; text-transform:uppercase; opacity:.85; margin-top:2px}
   #analysis .mcard .big{font-size:26px; font-weight:800; padding:10px 12px 0}
@@ -656,9 +657,9 @@
   #analysis .ct th{font-size:10.5px; letter-spacing:.07em; text-transform:uppercase; color:var(--muted); text-align:right; padding:7px 7px; border-bottom:2px solid var(--line); white-space:normal; line-height:1.15; vertical-align:bottom}
   #analysis .ct th:first-child,#analysis .ct td:first-child{text-align:left}
   #analysis .ct td{padding:7px 7px; border-bottom:1px solid var(--hair); text-align:right; white-space:nowrap; vertical-align:top}
-  #analysis .ct td.fnd{white-space:normal; min-width:190px; max-width:260px; text-align:left; line-height:1.3}
+  #analysis .ct td.fnd{white-space:normal; min-width:170px; max-width:230px; text-align:left; line-height:1.3}
   #analysis .ct tr.bad td.msg{white-space:normal; text-align:left}
-  #analysis .ct td.co{text-align:left; white-space:normal; min-width:150px; max-width:200px; line-height:1.25}
+  #analysis .ct td.co{text-align:left; white-space:normal; min-width:140px; max-width:180px; line-height:1.25}
   #analysis .ct td.co b{font-weight:800}
   #analysis .ct td.co span{color:var(--muted); font-size:11.5px}
   #analysis .ct tr.sel td{background:#FFF7E0}
@@ -769,7 +770,7 @@
           <span class="gtoggle" role="group" aria-label="Revenue growth basis">
             <button type="button" id="anYoY" aria-pressed="true">YoY</button><button type="button" id="anQoQ" aria-pressed="false">QoQ</button>
           </span>
-          <span class="gtlab">revenue growth basis</span>
+          <span class="gtlab">growth &amp; return basis</span>
           <span class="prog" id="anProg"><span class="pbar"><i id="anProgBar"></i></span><span id="anProgTxt">Fetching&hellip;</span></span>
         </div>
         <div class="errbox" id="anErr"></div>
@@ -780,6 +781,11 @@
           <div class="mapex"><div class="mt">Shareholder Value</div><div class="mm">ROIC (TTM)</div>
             <div class="big" id="mApexBig" style="font-size:30px; font-weight:800; margin-top:6px"></div>
             <div class="med" id="mApexMed" style="opacity:.85; font-size:12.5px"></div>
+            <div class="apxsub">
+              <div class="mm" id="mApexTsrLbl">TSR — 1-year</div>
+              <div class="big" id="mApexTsr" style="font-size:22px; font-weight:800; margin-top:2px"></div>
+              <div class="med" id="mApexTsrMed" style="opacity:.85; font-size:12px"></div>
+            </div>
           </div>
           <div class="mstem"></div>
           <div class="mrow" id="anCards"></div>
@@ -1828,7 +1834,7 @@
      means "no such filing/concept"). Public relays wrap or replace status codes, so
      their 404s are treated as route failures instead. */
   var TRUSTED=MY_RELAY?[0,1]:[0];
-  var relayIdx={sec:0, px:0};
+  var relayIdx={sec:0, px:MY_RELAY?1:0};
   var ROUTE_DEAD_AT=4;
   var routeFails={sec:RELAYS.map(function(){return 0;}), px:RELAYS.map(function(){return 0;})};
   var net={ok:0, tried:0};
@@ -1872,8 +1878,8 @@
         function done(){ if(tm) clearTimeout(tm); }
         return fetch(RELAYS[k](url), ctl?{signal:ctl.signal}:{}).then(function(r){
           if(r.status===404 && trusted){ var nf=new Error("not found"); nf.notFound=true; throw nf; }
-          if(r.status===403 || r.status===429 || r.status>=500){ var re=new Error("HTTP "+r.status); re.retryable=true; throw re; }
-          if(!r.ok) throw new Error("HTTP "+r.status);
+          if(r.status===403 || r.status===429 || r.status>=500){ var re=new Error("HTTP "+r.status); re.retryable=true; re.status=r.status; throw re; }
+          if(!r.ok){ var he=new Error("HTTP "+r.status); he.status=r.status; throw he; }
           return opt.maxBytes ? readCapped(r, opt.maxBytes, ctl).then(function(t){ return JSON.parse(t); }) : r.json();
         }).then(function(j){
           if(opt.validate && !opt.validate(j)) throw new Error("bad payload from route "+k);
@@ -1882,8 +1888,11 @@
           done();
           if(e && e.notFound){ relayIdx[kind]=k; routeFails[kind][k]=0; net.ok++; return null; }
           if(e && e.tooBig){ throw e; }
-          if(e && e.retryable && trusted && retry<2){ return sleep(1500*(retry+1)).then(function(){ return attempt(i, retry+1); }); }
-          routeFails[kind][k]++; lastErr=e; return attempt(i+1, 0);
+          if(e && e.retryable && trusted && retry<2 && (!opt.softStatus || e.status===429)){ return sleep(1500*(retry+1)).then(function(){ return attempt(i, retry+1); }); }
+          /* softStatus: an HTTP status is a per-request answer (e.g. the CDN refusing one
+             ticker), not proof the route is dead — try the next route without penalizing this one. */
+          if(!(opt.softStatus && e && e.status)) routeFails[kind][k]++;
+          lastErr=e; return attempt(i+1, 0);
         });
       });
     }
@@ -1904,6 +1913,7 @@
   var T_DEBT_C=[[GAAP,"LongTermDebtCurrent"],[GAAP,"LongTermDebtAndCapitalLeaseObligationsCurrent"],[GAAP,"DebtCurrent"],[GAAP,"ShortTermBorrowings"],[GAAP,"CommercialPaper"],[IFRS,"CurrentBorrowings"]];
   var T_EPS=[[GAAP,"EarningsPerShareDiluted"],[GAAP,"EarningsPerShareBasicAndDiluted"],[IFRS,"DilutedEarningsLossPerShare"],[GAAP,"EarningsPerShareBasic"],[IFRS,"BasicEarningsLossPerShare"]];
   var T_SHARES=[[DEI,"EntityCommonStockSharesOutstanding"]];
+  var T_DIV=[[GAAP,"CommonStockDividendsPerShareDeclared"],[GAAP,"CommonStockDividendsPerShareCashPaid"]];
   var ALL_CHAINS=[T_REV,T_OPI,T_PRETAX,T_TAX,T_INT,T_ASSETS,T_EQ,T_CASH,T_DEBT_L,T_DEBT_C,T_EPS,T_SHARES];
 
   /* ---- facts acquisition ---- */
@@ -1938,10 +1948,23 @@
             function(e){ return conceptFallback(cik, (e&&e.message)||"failed"); })
       .then(function(f){ factsCache[cik]=f; return f; });
   }
+  /* Daily closing prices (split-adjusted) from the same Cboe feed family as the quote. */
+  var histCache={};
+  function getHistory(t){
+    if(histCache[t]) return Promise.resolve(histCache[t]);
+    return fetchJSON("px","https://cdn.cboe.com/api/global/delayed_quotes/charts/historical/"+encodeURIComponent(t.replace("/","."))+".json",
+        {validate:function(j){ return j && j.data && j.data.length; }, timeout:25000, softStatus:true})
+      .then(function(j){
+        var rows=((j&&j.data)||[]).filter(function(r){ return r.date && r.close>0; }).sort(function(a,b){ return a.date<b.date?-1:1; });
+        var h={rows:rows}; histCache[t]=h; return h;
+      })
+      .catch(function(){ var h={rows:[]}; histCache[t]=h; return h; });
+  }
+  function closeOnOrBefore(rows, iso){ for(var i=rows.length-1;i>=0;i--){ if(rows[i].date<=iso) return rows[i]; } return null; }
   function getQuote(t){
     if(quoteCache[t]) return Promise.resolve(quoteCache[t]);
     return fetchJSON("px","https://cdn.cboe.com/api/global/delayed_quotes/quotes/"+encodeURIComponent(t.replace("/","."))+".json",
-        {validate:function(j){ return j && j.data; }})
+        {validate:function(j){ return j && j.data; }, softStatus:true, routes:TRUSTED})
       .then(function(j){
         var d=j&&j.data, px=d&&(d.current_price||d.close||d.prev_day_close);
         var q={px:(px&&px>0)?px:null, ts:(d&&(d.last_trade_time||d.tick))||null, live:!!(px&&px>0)};
@@ -1971,17 +1994,27 @@
      filed, the (tag, currency) pair with the most recent data wins; USD breaks ties. */
   function pickRevenue(facts){
     var best=null;
-    T_REV.forEach(function(tt, idx){
-      var node=facts.facts && facts.facts[tt[0]] && facts.facts[tt[0]][tt[1]];
+    function consider(tx, tg, idx, scanned){
+      var node=facts.facts && facts.facts[tx] && facts.facts[tx][tg];
       if(!node||!node.units) return;
       Object.keys(node.units).forEach(function(cur){
         if(!/^[A-Z]{3}$/.test(cur)) return;
         var s=durSeries(node.units[cur]); if(!s.length) return;
         var latest=s[s.length-1].end;
         var better = !best || latest>best.latest || (latest===best.latest && ((cur==="USD" && best.cur!=="USD") || (cur===best.cur && idx<best.idx)));
-        if(better) best={s:s, latest:latest, idx:idx, tag:tt[1], cur:cur};
+        if(better) best={s:s, latest:latest, idx:idx, tag:tg, cur:cur, scanned:!!scanned};
       });
-    });
+    }
+    T_REV.forEach(function(tt, idx){ consider(tt[0], tt[1], idx, false); });
+    /* Last resort: if nothing current was found under the known tags, look for any
+       top-line revenue tag by name (components and unrelated "revenue" concepts excluded). */
+    if(!best || monthsAgo(best.latest)>18){
+      var EXCL=/Cost|Deferred|Unearned|Receivable|Recognized|Tax|Percent|Remaining|RelatedPart|Segment|Other|Discontinued|Interest|Allowance|Return|Refund|Increase|Decrease|Gain|Loss|Expense|Payable|Liabilit|Asset|Per[A-Z]|Backlog|Unbilled|Concentration|Recogni|Financing|Lease|Grant|Royalt|Licens|Collaborat|Milestone/;
+      [GAAP,IFRS].forEach(function(tx){
+        var T=facts.facts && facts.facts[tx]; if(!T) return;
+        Object.keys(T).forEach(function(tg){ if(/Revenue|Sales/.test(tg) && !EXCL.test(tg)) consider(tx, tg, 999, true); });
+      });
+    }
     return best;
   }
   function durSeries(un){
@@ -2079,8 +2112,8 @@
   }
   function monthsAgo(iso){ return days(iso, new Date().toISOString().slice(0,10))/30.4; }
 
-  function computeMetrics(row, facts, quote){
-    var out={t:row[0], name:row[1], ok:true, notes:[], flags:{}, nm:{}, src:facts._src||""};
+  function computeMetrics(row, facts, quote, hist){
+    var out={t:row[0], name:row[1], ok:true, notes:[], flags:{}, nm:{}, tsr:{}, src:facts._src||""};
     var fin=(row[3]==="Finance");
     try{
       var R=pickRevenue(facts);
@@ -2090,6 +2123,7 @@
       if(!revTTM) throw new Error("revenue periods could not be assembled");
       if(monthsAgo(revTTM.end)>18) throw new Error("latest SEC financial data ends "+fmtDate(revTTM.end));
       out.fEnd=revTTM.end; out.fMode=revTTM.mode; out.revTag=R.tag;
+      if(R.scanned) out.notes.push("revenue taken from tag \u201c"+R.tag+"\u201d (matched by name)");
       if(revTTM.derived) out.flags.f=true;
       if(monthsAgo(revTTM.end)>9) out.notes.push("latest filing data is "+Math.round(monthsAgo(revTTM.end))+" months old");
       if(R.cur!=="USD") out.notes.push("reported in "+R.cur);
@@ -2097,7 +2131,7 @@
 
       /* growth */
       var qs=deriveQuarters(R.s), y=R.s.filter(isFY);
-      if(qs.length){
+      if(qs.length && days(qs[qs.length-1].end, revTTM.end)<=100){
         var ql=qs[qs.length-1], prev=qs.length>1?qs[qs.length-2]:null;
         if(prev && near(addDays(prev.end,1), ql.start, 6) && prev.val>0){ out.qoq=ql.val/prev.val-1; if(ql.derived||prev.derived) out.flags.qoq=true; }
         var ya=null, target=addDays(ql.end,-365);
@@ -2164,11 +2198,15 @@
 
       /* earnings multiple */
       var EP=pickSeries(facts,T_EPS,"dur","eps",cur), epsTTM=EP?ttmOf(EP.s):null;
-      var px=(quote&&quote.live&&quote.px)?quote.px:row[5];
-      out.px=px; out.pxLive=!!(quote&&quote.live);
-      out.pxAsOf=out.pxLive?(quote.ts?String(quote.ts):"delayed quote"):("close "+fmtDate(U.asof));
+      var rows=(hist&&hist.rows)||[];
+      var px=null;
+      if(quote&&quote.live&&quote.px){ px=quote.px; out.pxLive=true; out.pxAsOf="delayed live"; }
+      else if(rows.length){ px=rows[rows.length-1].close; out.pxLive=false; out.pxAsOf="close "+fmtDate(rows[rows.length-1].date); }
+      else { out.pxLive=false; out.pxAsOf="unavailable"; out.notes.push("no current price could be fetched \u2014 P/E n/a"); }
+      out.px=px;
       var epsUSD = EP && /^USD\//i.test(EP.cur) && cur==="USD";
-      if(foreign || (EP && !epsUSD)){
+      if(px==null){ out.pe=null; }
+      else if(foreign || (EP && !epsUSD)){
         out.pe=null; out.notes.push(foreign ? "foreign filer (20-F/40-F) \u2014 P/E n/a (ADR ratio)" : "EPS reported in "+EP.cur+" \u2014 P/E n/a");
       }
       else if(epsTTM && epsTTM.val>0){ out.pe=px/epsTTM.val; out.peEnd=epsTTM.end; if(epsTTM.derived) out.flags.pe=true; }
@@ -2178,8 +2216,33 @@
       if(!foreign && R.cur==="USD"){
         var S=pickSeries(facts,T_SHARES,"inst","shares",cur);
         var shNow=S?valAsOf(S.s,null):null;
-        if(shNow && shNow.val>0) out.mcapLive=px*shNow.val;
+        if(shNow && shNow.val>0 && px!=null) out.mcapLive=px*shNow.val;
       }
+
+      /* total shareholder return = (price change + dividends per share) / starting price,
+         over a trailing 1-year or 1-quarter window ending at the latest close. Dividends
+         come from the filer's dividends-per-share facts, aligned to the window by period end. */
+      if(rows.length){
+        var last=rows[rows.length-1];
+        var DV=(!foreign && cur==="USD") ? pickSeries(facts,T_DIV,"dur","eps",cur) : null;
+        var dq=DV?deriveQuarters(DV.s):[], dfy=DV?DV.s.filter(isFY):[];
+        var tsrDerived=false, annualUsed=false;
+        function windowRet(daysBack, key){
+          var start=closeOnOrBefore(rows, addDays(last.date,-daysBack));
+          if(!start || days(start.date,last.date)<daysBack*0.8) return;
+          var divs=0, n=0;
+          dq.forEach(function(e){ if(e.end>start.date && e.end<=last.date && e.val>0){ divs+=e.val; n++; if(e.derived) tsrDerived=true; } });
+          if(!n && daysBack>300){ dfy.forEach(function(e){ if(e.end>start.date && e.end<=last.date && e.val>0){ divs+=e.val; n++; annualUsed=true; } }); }
+          out.tsr[key]={val:(last.close-start.close+divs)/start.close, start:start.date, end:last.date, divs:divs};
+        }
+        windowRet(365,"yoy"); windowRet(91,"qoq");
+        out.tsrEnd=last.date;
+        if(foreign) out.notes.push("TSR is price return only \u2014 ADR dividends are not in SEC data");
+        else if(!DV) out.notes.push("no dividends-per-share tag filed \u2014 TSR shown as price return");
+        if(annualUsed) out.notes.push("annual dividend figure used in TSR");
+        if(tsrDerived) out.flags.tsr=true;
+        if(!out.tsr.yoy && !out.tsr.qoq) out.notes.push("price history too short \u2014 TSR n/a");
+      } else out.notes.push("price history unavailable \u2014 TSR n/a");
     }catch(err){
       out.ok=false; out.err=err.message||"parse error";
     }
@@ -2219,8 +2282,8 @@
       if(seq!==runSeq) return Promise.resolve();
       var i=idx++; if(i>=list.length) return Promise.resolve();
       var t=list[i], row=BYT[t];
-      return Promise.all([ getFacts(row[6]), getQuote(t) ])
-        .then(function(v){ results[i]=computeMetrics(row, v[0], v[1]); })
+      return Promise.all([ getFacts(row[6]), getQuote(t), getHistory(t) ])
+        .then(function(v){ results[i]=computeMetrics(row, v[0], v[1], v[2]); })
         .catch(function(e){ results[i]={t:t,name:row[1],ok:false,err:(e&&e.message)||"fetch failed"}; })
         .then(function(){
           done++;
@@ -2287,6 +2350,14 @@
     var peerRoics=ok.slice(0).filter(function(r){return r!==mine;}).map(function(r){return r.roic;}).filter(function(v){return v!=null&&isFinite(v);});
     $("mApexBig").innerHTML = mine.ok ? ((mine.nmFin||mine.nm.roic) ? '<span class="na" title="not meaningful \u2014 see table">n/m</span>' : fmtVal("pct",mine.roic)) : '<span class="na">n/a</span>';
     $("mApexMed").textContent = peerRoics.length? ("peer median "+pct(median(peerRoics))+(mine.ok&&mine.roic!=null?(" \u00b7 "+ord(rankOf(mine.roic,roics,true))+" of "+roics.length):"")) : "";
+    /* TSR beneath ROIC */
+    function tsrOf(r){ var x=r.ok&&r.tsr&&r.tsr[G]; return (x&&isFinite(x.val))?x.val:null; }
+    var tsrAll=ok.map(tsrOf).filter(function(v){ return v!=null; });
+    var tsrPeers=ok.filter(function(r){ return r!==mine; }).map(tsrOf).filter(function(v){ return v!=null; });
+    var myTsr=tsrOf(mine);
+    $("mApexTsrLbl").textContent="TSR \u2014 "+(basis==="yoy"?"1-year":"1-quarter")+(mine.ok&&mine.tsrEnd?(" to "+fmtDate(mine.tsrEnd)):"");
+    $("mApexTsr").innerHTML = myTsr!=null ? fmtVal("pct",myTsr) : '<span class="na">n/a</span>';
+    $("mApexTsrMed").textContent = tsrPeers.length ? ("peer median "+pct(median(tsrPeers))+(myTsr!=null?(" \u00b7 "+ord(rankOf(myTsr,tsrAll,true))+" of "+tsrAll.length):"")) : "";
 
     var cards="";
     METRICS.forEach(function(M){
@@ -2307,22 +2378,23 @@
     var NM='<span class="na" title="financial company \u2014 not meaningful">n/m</span>';
     function dv(on){ return on?'<span class="dv" title="includes a derived figure \u2014 see notes">\u2020</span>':''; }
     function NM2(why){ return '<span class="na" title="'+esc(why)+' \u2014 not meaningful">n/m</span>'; }
-    var h='<tr><th>Company</th><th>ROIC</th><th>Rev growth '+(basis==="yoy"?"YoY":"QoQ")+'</th><th>Op margin (a.t.)</th><th>Asset turnover</th><th>P/E</th><th>Price</th><th>Mkt cap</th><th>Fundamentals as of</th></tr>';
+    var h='<tr><th>Company</th><th>ROIC</th><th>TSR '+(basis==="yoy"?"1-yr":"1-qtr")+'</th><th>Rev growth '+(basis==="yoy"?"YoY":"QoQ")+'</th><th>Op margin (a.t.)</th><th>Asset turnover</th><th>P/E</th><th>Price</th><th>Mkt cap</th><th>Fundamentals as of</th></tr>';
     res.forEach(function(r,i){
       var row=BYT[r.t];
       if(!r.ok){
-        h+='<tr class="bad'+(i===0?" sel":"")+'"><td class="co"><b>'+esc(r.t)+'</b> <span>'+esc(r.name)+'</span></td><td class="msg" colspan="8">data unavailable \u2014 '+esc(r.err||"fetch failed")+'</td></tr>';
+        h+='<tr class="bad'+(i===0?" sel":"")+'"><td class="co"><b>'+esc(r.t)+'</b> <span>'+esc(r.name)+'</span></td><td class="msg" colspan="9">data unavailable \u2014 '+esc(r.err||"fetch failed")+'</td></tr>';
         return;
       }
       h+='<tr'+(i===0?' class="sel"':'')+'>'
         + '<td class="co"><b>'+esc(r.t)+'</b> <span>'+esc(r.name)+'</span></td>'
         + '<td>'+((r.nmFin||r.nm.roic)?NM2(r.nmFin?"financial company":"negative invested capital"):fmtVal("pct",r.roic)+dv(r.flags.roic))+'</td>'
+        + '<td>'+(function(){ var x=r.tsr&&r.tsr[G]; if(!x) return '<span class="na">n/a</span>'; return fmtVal("pct",x.val)+dv(r.flags.tsr&&x.divs>0)+'<span class="asf">'+esc(fmtDate(x.start))+" \u2192 "+esc(fmtDate(x.end))+'</span>'; })()+'</td>'
         + '<td>'+fmtVal("pct",r[G])+dv(r.flags[G]&&r[G]!=null)+(r.gPer?'<span class="asf">'+esc(r.gPer)+'</span>':'')+'</td>'
         + '<td>'+(r.nmFin?NM:fmtVal("pct",r.opMargin)+dv(r.flags.om))+'</td>'
         + '<td>'+fmtVal("turn",r.turn)+dv(r.flags.f&&r.turn!=null)+'</td>'
         + '<td>'+(r.nm.pe?NM2("negative earnings"):fmtVal("pe",r.pe)+dv(r.flags.pe&&r.pe!=null))+'</td>'
-        + '<td>$'+(r.px?r.px.toFixed(2):"\u2014")+'<span class="asf">'+esc(r.pxLive?"delayed live":"prior close "+fmtDate(U.asof))+'</span></td>'
-        + '<td>'+(r.mcapLive?fmtMcap(r.mcapLive):fmtMcap(row[4]))+'</td>'
+        + '<td>'+(r.px!=null?'$'+r.px.toFixed(2):'<span class="na">n/a</span>')+'<span class="asf">'+esc(r.pxAsOf||"")+'</span></td>'
+        + '<td>'+(r.mcapLive?fmtMcap(r.mcapLive):fmtMcap(row[4])+'<span class="asf">as of '+esc(fmtDate(U.asof))+'</span>')+'</td>'
         + '<td class="fnd">'+esc(r.fMode==="FY"?"Latest FY":"TTM")+dv(r.flags.f)+'<span class="asf">'+(r.fEnd?("to "+fmtDate(r.fEnd)):"")+(r.flags.f?" \u00b7 Q4 derived from 10-K":"")+(r.notes&&r.notes.length?" \u00b7 "+esc(r.notes.join("; ")):"")+'</span></td>'
         + '</tr>';
     });
@@ -2333,7 +2405,8 @@
       + 'ROIC = after-tax operating income (NOPAT, using each company\u2019s effective tax rate) \u00f7 average invested capital (total equity + total debt \u2212 cash). '
       + 'Operating margin (after taxes) = NOPAT \u00f7 revenue. Gross asset turnover = TTM revenue \u00f7 average total assets. '
       + 'Earnings multiple = share price \u00f7 trailing diluted EPS (n/m when EPS \u2264 0). '
-      + 'Requests travel through the InsightMaps relay (public relays as fallback). Prices: Cboe delayed quotes when reachable, otherwise the '+fmtDate(U.asof)+' close embedded in this file; the ticker list, industries and market-cap ordering are also from the '+fmtDate(U.asof)+' snapshot. Figures are for discussion, not investment advice.';
+      + 'TSR (total shareholder return) = (closing price at the end of the window \u2212 closing price at the start + dividends per share declared for fiscal periods ending inside the window) \u00f7 starting price, over a trailing 1-year or 1-quarter window ending at the latest available close; dividends are not compounded. Prices are split-adjusted daily closes; dividends come from the filer\u2019s SEC dividends-per-share facts, so ADRs and filers without that tag show price return only, as noted. '
+      + 'Requests travel through the InsightMaps relay (public relays as fallback). Prices: Cboe delayed quotes when reachable, otherwise the latest daily close from the price history (dated in the table); never a stored price. Market cap is computed from that price and filed shares outstanding where possible, otherwise shown from the '+fmtDate(U.asof)+' snapshot with its date; the ticker list, industries and market-cap ordering are also from that snapshot. Figures are for discussion, not investment advice.';
     $("anRes").classList.add("on");
     $("anRes").scrollIntoView({behavior:"smooth", block:"nearest"});
   }
