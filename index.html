@@ -1808,35 +1808,49 @@
      is normally blocked. We try direct first (future-proof), then fall back through
      public CORS relays, and remember whichever route works for the rest of the session. */
   var factsCache={}, quoteCache={};
+  /* Optional personal relay (e.g. a free Cloudflare Worker). If set, it is tried
+     FIRST for every request and makes the public relays below irrelevant.
+     Format: a URL prefix that takes the target URL as a ?url= parameter, e.g.
+     "https://evm-relay.yourname.workers.dev/?url=" */
+  var MY_RELAY="https://evm-relay.ryandickinson444.workers.dev/?url=";
   var RELAYS=[
     function(u){ return u; },
     function(u){ return "https://corsproxy.io/?url="+encodeURIComponent(u); },
     function(u){ return "https://api.allorigins.win/raw?url="+encodeURIComponent(u); },
     function(u){ return "https://api.codetabs.com/v1/proxy?quest="+encodeURIComponent(u); }
   ];
+  if(MY_RELAY){ RELAYS.unshift(function(u){ return MY_RELAY+encodeURIComponent(u); }); }
   var relayIdx={sec:0, px:0};
+  /* Circuit breaker: once a route fails this many times in a row for a given data
+     kind, stop wasting time on it for the rest of the session. A success resets it.
+     Without this, a dead-relay day means hundreds of doomed 10s-timeout attempts
+     and the run appears frozen at 0/N. */
+  var ROUTE_DEAD_AT=4;
+  var routeFails={sec:RELAYS.map(function(){return 0;}), px:RELAYS.map(function(){return 0;})};
   function fetchJSON(kind, url, validate){
     var start=relayIdx[kind], lastErr=null;
     function attempt(i){
       if(i>=RELAYS.length) return Promise.reject(lastErr||new Error("all routes failed"));
       var k=(start+i)%RELAYS.length;
+      if(routeFails[kind][k]>=ROUTE_DEAD_AT) return attempt(i+1);
+      net.tried++;
       var ctl=(typeof AbortController!=="undefined")?new AbortController():null;
-      var tm=ctl?setTimeout(function(){ ctl.abort(); },30000):null;
+      var tm=ctl?setTimeout(function(){ ctl.abort(); },10000):null;
       function done(){ if(tm) clearTimeout(tm); }
       return fetch(RELAYS[k](url), ctl?{signal:ctl.signal}:{}).then(function(r){
         if(!r.ok) throw new Error("HTTP "+r.status);
         return r.json();
       }).then(function(j){
         if(validate && !validate(j)) throw new Error("bad payload from route "+k);
-        done(); relayIdx[kind]=k; return j;
-      }).catch(function(e){ done(); lastErr=e; return attempt(i+1); });
+        done(); relayIdx[kind]=k; routeFails[kind][k]=0; return j;
+      }).catch(function(e){ done(); routeFails[kind][k]++; lastErr=e; return attempt(i+1); });
     }
     return attempt(0);
   }
   /* Whole-company facts files run to tens of MB for large filers and choke public
      relays. Fetch per-concept endpoints instead (tens of KB each) and assemble a
      facts-shaped object; tag chains fall back across GAAP/IFRS variants. */
-  var net={ok:0}, conceptCache={};
+  var net={ok:0, tried:0}, conceptCache={};
   var inflight=0, waiters=[];
   function gate(){ if(inflight<6){ inflight++; return Promise.resolve(); } return new Promise(function(res){ waiters.push(res); }); }
   function ungate(){ inflight--; var w=waiters.shift(); if(w){ inflight++; w(); } }
@@ -2072,6 +2086,21 @@
     $("anProgTxt").textContent="Fetching SEC filings\u2026 0/"+total;
     $("anRun").disabled=true; $("anErr").classList.remove("on");
 
+    /* Watchdog: keeps the progress text alive (request counter) and, if not a
+       single request has succeeded after 60 seconds, cancels the run and shows
+       the planned error instead of leaving the bar stuck at 0/N. */
+    var t0=Date.now(), okAtStart=net.ok;
+    var watch=setInterval(function(){
+      if(seq!==runSeq){ clearInterval(watch); return; }
+      var el=Math.round((Date.now()-t0)/1000);
+      $("anProgTxt").textContent="Fetching SEC filings\u2026 "+done+"/"+total+" \u00b7 "+net.tried+" requests tried";
+      if(net.ok===okAtStart && el>=60){
+        clearInterval(watch); runSeq++;
+        $("anProg").classList.remove("on"); $("anRun").disabled=false;
+        showErr("Could not reach SEC EDGAR by any route (direct or relay) \u2014 "+net.tried+" requests tried in "+el+"s with no data returned. The free public relays this page depends on appear to be down or blocking requests. Try again in a few minutes or from another network.");
+      }
+    }, 1000);
+
     var results=new Array(list.length);
     var idx=0, CONC=4;
     function next(){
@@ -2084,13 +2113,13 @@
         .then(function(){
           done++;
           $("anProgBar").style.width=Math.round(4+92*done/total)+"%";
-          $("anProgTxt").textContent="Fetching SEC filings\u2026 "+done+"/"+total;
           return next();
         });
     }
     var lanes=[]; for(var l=0;l<Math.min(CONC,list.length);l++) lanes.push(next());
     Promise.all(lanes).then(function(){
       if(seq!==runSeq) return;
+      clearInterval(watch);
       $("anProg").classList.remove("on"); $("anRun").disabled=false;
       lastRun={list:list, results:results};
       var okc=results.filter(function(r){ return r.ok; }).length;
