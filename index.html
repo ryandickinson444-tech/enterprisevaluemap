@@ -1833,11 +1833,50 @@
     }
     return attempt(0);
   }
+  /* Whole-company facts files run to tens of MB for large filers and choke public
+     relays. Fetch per-concept endpoints instead (tens of KB each) and assemble a
+     facts-shaped object; tag chains fall back across GAAP/IFRS variants. */
+  var net={ok:0}, conceptCache={};
+  var inflight=0, waiters=[];
+  function gate(){ if(inflight<6){ inflight++; return Promise.resolve(); } return new Promise(function(res){ waiters.push(res); }); }
+  function ungate(){ inflight--; var w=waiters.shift(); if(w){ inflight++; w(); } }
+  function getConcept(cik, tx, tg){
+    var key=cik+"/"+tx+"/"+tg;
+    if(conceptCache[key]!==undefined) return Promise.resolve(conceptCache[key]);
+    return gate().then(function(){
+      return fetchJSON("sec","https://data.sec.gov/api/xbrl/companyconcept/CIK"+cik+"/"+tx+"/"+tg+".json",
+          function(j){ return j && j.units; })
+        .then(function(j){ ungate(); net.ok++; conceptCache[key]=j; return j; })
+        .catch(function(e){ ungate(); conceptCache[key]=null; return null; });
+    });
+  }
+  function resolveSlot(cik, chain){
+    var i=0;
+    function tryNext(){
+      if(i>=chain.length) return Promise.resolve(null);
+      var tx=chain[i][0], tg=chain[i][1]; i++;
+      return getConcept(cik, tx, tg).then(function(j){
+        if(j && j.units) return {tx:tx, tg:tg, units:j.units};
+        return tryNext();
+      });
+    }
+    return tryNext();
+  }
   function getFacts(cik){
     if(factsCache[cik]) return Promise.resolve(factsCache[cik]);
-    return fetchJSON("sec","https://data.sec.gov/api/xbrl/companyfacts/CIK"+cik+".json",
-        function(j){ return j && j.facts; })
-      .then(function(j){ factsCache[cik]=j; return j; });
+    var SLOTS=[T_REV,T_OPI,T_PRETAX,T_TAX,T_ASSETS,T_EQ,T_CASH,T_DEBT_L,T_DEBT_C,T_EPS,T_SHARES];
+    return Promise.all(SLOTS.map(function(ch){ return resolveSlot(cik, ch); }))
+      .then(function(rs){
+        var facts={facts:{}};
+        rs.forEach(function(r){
+          if(!r) return;
+          if(!facts.facts[r.tx]) facts.facts[r.tx]={};
+          facts.facts[r.tx][r.tg]={units:r.units};
+        });
+        var any=false, k; for(k in facts.facts){ any=true; break; }
+        if(!any) throw new Error(net.ok ? "no SEC data found" : "all routes failed");
+        factsCache[cik]=facts; return facts;
+      });
   }
   function getQuote(t){
     if(quoteCache[t]) return Promise.resolve(quoteCache[t]);
@@ -1923,7 +1962,7 @@
   var T_PRETAX=[[GAAP,"IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"],[GAAP,"IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments"],[IFRS,"ProfitLossBeforeTax"]];
   var T_TAX=[[GAAP,"IncomeTaxExpenseBenefit"],[IFRS,"IncomeTaxExpenseContinuingOperations"],[IFRS,"TaxExpense"]];
   var T_ASSETS=[[GAAP,"Assets"],[IFRS,"Assets"]];
-  var T_EQ=[[GAAP,"StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"],[GAAP,"StockholdersEquity"],[IFRS,"Equity"],[IFRS,"EquityAttributableToOwnersOfParent"]];
+  var T_EQ=[[GAAP,"StockholdersEquity"],[GAAP,"StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"],[IFRS,"Equity"],[IFRS,"EquityAttributableToOwnersOfParent"]];
   var T_CASH=[[GAAP,"CashAndCashEquivalentsAtCarryingValue"],[GAAP,"CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"],[IFRS,"CashAndCashEquivalents"]];
   var T_EPS=[[GAAP,"EarningsPerShareDiluted"],[GAAP,"EarningsPerShareBasicAndDiluted"],[IFRS,"DilutedEarningsLossPerShare"],[GAAP,"EarningsPerShareBasic"],[IFRS,"BasicEarningsLossPerShare"]];
   var T_DEBT_L=[[GAAP,"LongTermDebtNoncurrent"],[GAAP,"LongTermDebt"],[IFRS,"NoncurrentBorrowings"]] ;
@@ -2055,7 +2094,12 @@
       $("anProg").classList.remove("on"); $("anRun").disabled=false;
       lastRun={list:list, results:results};
       var okc=results.filter(function(r){ return r.ok; }).length;
-      if(!okc){ showErr("Could not load data for any company. Live fundamentals come from SEC EDGAR routed through public relays; if every route is blocked on this network, try again in a minute or from another network."); return; }
+      if(!okc){
+        showErr(net.ok
+          ? "SEC responded but no usable figures were found for these companies \u2014 this usually means a temporary EDGAR issue; try again in a minute."
+          : "Could not reach SEC EDGAR by any route (direct or relay). The relays are free public services and occasionally go down together \u2014 try again in a minute or from another network.");
+        return;
+      }
       if(okc<results.length){
         showErr((results.length-okc)+" of "+results.length+" companies couldn\u2019t be loaded and are excluded (see table)." );
       }
@@ -2141,7 +2185,7 @@
     $("anTable").innerHTML=h;
 
     $("anNote").innerHTML =
-      '<b>Definitions & sources.</b> Fundamentals are fetched live from SEC EDGAR company facts (XBRL) at the moment you run the analysis; each row shows the period covered (trailing twelve months where quarterly data exists, otherwise the latest annual filing \u2014 common for foreign filers). '
+      '<b>Definitions & sources.</b> Fundamentals are fetched live from SEC EDGAR (per-concept XBRL API) at the moment you run the analysis; each row shows the period covered (trailing twelve months where quarterly data exists, otherwise the latest annual filing \u2014 common for foreign filers). '
       + 'ROIC = after-tax operating income (NOPAT, using each company\u2019s effective tax rate) \u00f7 average invested capital (total equity + total debt \u2212 cash). '
       + 'Operating margin (after taxes) = NOPAT \u00f7 revenue. Gross asset turnover = TTM revenue \u00f7 average total assets. '
       + 'Earnings multiple = share price \u00f7 trailing diluted EPS (n/m when EPS \u2264 0). '
